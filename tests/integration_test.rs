@@ -689,3 +689,821 @@ fn test_distribute_secondary_fuzz_style() {
         assert_eq!(client.get_secondary_pool(), 0, "Secondary pool must be zero after distribution");
     }
 }
+
+// ── Issue #245: hard cap of 10 recipients ────────────────────────────────────
+
+/// Issue #245 — initialize with exactly 10 recipients must succeed.
+#[test]
+fn test_initialize_with_10_recipients_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let mut addrs: SorobanVec<Address> = SorobanVec::new(&env);
+    let mut shares: SorobanVec<u32> = SorobanVec::new(&env);
+    
+    for _ in 0..10 {
+        addrs.push_back(Address::generate(&env));
+        shares.push_back(1_000_u32);
+    }
+
+    client.initialize(&addrs, &shares);
+    assert_eq!(client.collaborator_count(), 10);
+}
+
+/// Issue #245 — initialize with 11 recipients must panic with descriptive error.
+#[test]
+#[should_panic(expected = "too many recipients: maximum 10 allowed")]
+fn test_initialize_with_11_recipients_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let mut addrs: SorobanVec<Address> = SorobanVec::new(&env);
+    let mut shares: SorobanVec<u32> = SorobanVec::new(&env);
+    
+    for i in 0..11 {
+        addrs.push_back(Address::generate(&env));
+        // First recipient gets 1000, others get 900 to sum to 10,000
+        shares.push_back(if i == 0 { 1_000_u32 } else { 900_u32 });
+    }
+
+    client.initialize(&addrs, &shares);
+}
+
+/// Issue #245 — initialize with 15 recipients must panic with descriptive error.
+#[test]
+#[should_panic(expected = "too many recipients: maximum 10 allowed")]
+fn test_initialize_with_15_recipients_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let mut addrs: SorobanVec<Address> = SorobanVec::new(&env);
+    let mut shares: SorobanVec<u32> = SorobanVec::new(&env);
+    
+    for _ in 0..15 {
+        addrs.push_back(Address::generate(&env));
+        shares.push_back(666_u32); // Won't sum to 10,000 but cap check happens first
+    }
+
+    client.initialize(&addrs, &shares);
+}
+
+// ── Issue #234: re-initialization guard ──────────────────────────────────────
+
+/// Issue #234 — calling initialize twice must panic with descriptive error.
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_initialize_twice_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    
+    client.initialize(&vec![&env, a.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+    
+    // Second initialization attempt must panic
+    let c = Address::generate(&env);
+    let d = Address::generate(&env);
+    client.initialize(&vec![&env, c, d], &vec![&env, 6000_u32, 4000_u32]);
+}
+
+/// Issue #234 — re-initialization attempt must not modify existing state.
+#[test]
+fn test_reinitialize_does_not_modify_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    
+    client.initialize(&vec![&env, a.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+    
+    let original_count = client.collaborator_count();
+    let original_share_a = client.get_share(&a);
+    
+    // Attempt second initialization (will panic, but we catch it)
+    let c = Address::generate(&env);
+    let d = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(&vec![&env, c, d], &vec![&env, 6000_u32, 4000_u32]);
+    }));
+    
+    assert!(result.is_err(), "Second initialization should panic");
+    
+    // Verify original state is unchanged
+    assert_eq!(client.collaborator_count(), original_count);
+    assert_eq!(client.get_share(&a), original_share_a);
+}
+
+// ── Issue #242: admin_transfer ───────────────────────────────────────────────
+
+fn read_admin(env: &Env, contract_id: &Address) -> Address {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set")
+    })
+}
+
+#[test]
+fn test_admin_transfer_updates_admin() {
+    let env = Env::default();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(
+        &vec![&env, admin.clone(), b],
+        &vec![&env, 5000_u32, 5000_u32],
+    );
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "admin_transfer",
+            args: (&new_admin,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.admin_transfer(&new_admin);
+
+    assert_eq!(read_admin(&env, &contract_id), new_admin);
+}
+
+#[test]
+fn test_admin_transfer_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    client.initialize(
+        &vec![&env, admin.clone(), b],
+        &vec![&env, 5000_u32, 5000_u32],
+    );
+    client.admin_transfer(&new_admin);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(cid, topics, data)| {
+        cid == contract_id
+            && topics
+                == vec![
+                    &env,
+                    symbol_short!("royalty").into_val(&env),
+                    symbol_short!("admin_xfr").into_val(&env),
+                ]
+            && data == (admin, new_admin).into_val(&env)
+    });
+    assert!(found, "admin_xfr event not emitted");
+}
+
+#[test]
+#[should_panic]
+fn test_admin_transfer_requires_admin_auth() {
+    let env = Env::default();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(
+        &vec![&env, admin, b],
+        &vec![&env, 5000_u32, 5000_u32],
+    );
+
+    // No mock auths for admin_transfer — must panic on require_auth
+    client.admin_transfer(&new_admin);
+}
+
+// ── Issue #236: empty recipients guard on distribute ─────────────────────────
+
+/// Calling distribute with an empty collaborators list must panic before transfers.
+#[test]
+#[should_panic(expected = "recipients list cannot be empty")]
+fn test_distribute_empty_recipients_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(
+        &vec![&env, admin.clone(), b],
+        &vec![&env, 5000_u32, 5000_u32],
+    );
+    mint(&env, &token, &contract_id, 1000);
+
+    let empty_collaborators: SorobanVec<Address> = vec![&env];
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Collaborators, &empty_collaborators);
+    });
+
+    client.distribute(&token);
+}
+
+// ── Default Recipients Tests ─────────────────────────────────────────────────
+
+/// Test setting default recipients with admin authorization
+#[test]
+fn test_set_default_recipients_requires_admin_auth() {
+    let env = Env::default();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&vec![&env, admin.clone(), b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let recipient2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_default_recipients",
+            args: (recipients.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.set_default_recipients(&recipients);
+
+    let defaults = client.get_default_recipients();
+    assert_eq!(defaults.len(), 2);
+}
+
+/// Test that set_default_recipients rejects empty list
+#[test]
+#[should_panic(expected = "recipients list cannot be empty")]
+fn test_set_default_recipients_empty_list_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let empty_recipients: Vec<Recipient> = vec![&env];
+    client.set_default_recipients(&empty_recipients);
+}
+
+/// Test that set_default_recipients rejects more than 10 recipients
+#[test]
+#[should_panic(expected = "too many recipients: maximum 10 allowed")]
+fn test_set_default_recipients_too_many_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let mut recipients: Vec<Recipient> = Vec::new(&env);
+    for _ in 0..11 {
+        recipients.push_back(Recipient { address: Address::generate(&env), share: 909_u32 });
+    }
+
+    client.set_default_recipients(&recipients);
+}
+
+/// Test that set_default_recipients rejects shares that don't sum to 10000
+#[test]
+#[should_panic(expected = "shares must sum to 10000")]
+fn test_set_default_recipients_invalid_share_sum_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin, share: 5000_u32 };
+    let recipient2 = Recipient { address: b, share: 4000_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+
+    client.set_default_recipients(&recipients);
+}
+
+/// Test that set_default_recipients rejects zero shares
+#[test]
+#[should_panic(expected = "share cannot be zero")]
+fn test_set_default_recipients_zero_share_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin, share: 10000_u32 };
+    let recipient2 = Recipient { address: b, share: 0_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+
+    client.set_default_recipients(&recipients);
+}
+
+/// Test that set_default_recipients rejects duplicate addresses
+#[test]
+#[should_panic(expected = "duplicate recipient address")]
+fn test_set_default_recipients_duplicate_address_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin.clone(), share: 5000_u32 };
+    let recipient2 = Recipient { address: admin.clone(), share: 5000_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+
+    client.set_default_recipients(&recipients);
+}
+
+/// Test that set_default_recipients emits an event
+#[test]
+fn test_set_default_recipients_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let recipient2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+    client.set_default_recipients(&recipients);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(cid, topics, data)| {
+        cid == contract_id
+            && topics
+                == vec![
+                    &env,
+                    symbol_short!("default").into_val(&env),
+                    symbol_short!("recipients_set").into_val(&env),
+                ]
+            && data == 2_u32.into_val(&env)
+    });
+    assert!(found, "recipients_set event not emitted");
+}
+
+/// Test get_default_recipients returns empty when not set
+#[test]
+fn test_get_default_recipients_empty_when_not_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let defaults = client.get_default_recipients();
+    assert_eq!(defaults.len(), 0);
+}
+
+/// Test get_default_recipients returns configured list
+#[test]
+fn test_get_default_recipients_returns_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let recipient1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let recipient2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let recipients = vec![&env, recipient1, recipient2];
+    client.set_default_recipients(&recipients);
+
+    let defaults = client.get_default_recipients();
+    assert_eq!(defaults.len(), 2);
+    assert_eq!(defaults.get(0).unwrap().address, admin);
+    assert_eq!(defaults.get(0).unwrap().share, 6000);
+    assert_eq!(defaults.get(1).unwrap().address, b);
+    assert_eq!(defaults.get(1).unwrap().share, 4000);
+}
+
+// ── Distribute with Override Tests ───────────────────────────────────────────
+
+/// Test distribute_with_override uses override recipients when provided
+#[test]
+fn test_distribute_with_override_uses_override() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let default1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let default2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let defaults = vec![&env, default1, default2];
+    client.set_default_recipients(&defaults);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    let override1 = Recipient { address: c.clone(), share: 10000_u32 };
+    let overrides = vec![&env, override1];
+    client.distribute_with_override(&token, overrides);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&c), 1000);
+    assert_eq!(TokenClient::new(&env, &token).balance(&admin), 0);
+    assert_eq!(TokenClient::new(&env, &token).balance(&b), 0);
+}
+
+/// Test distribute_with_override falls back to defaults when override is empty
+#[test]
+fn test_distribute_with_override_falls_back_to_defaults() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let default1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let default2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let defaults = vec![&env, default1, default2];
+    client.set_default_recipients(&defaults);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token, empty_override);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&admin), 600);
+    assert_eq!(TokenClient::new(&env, &token).balance(&b), 400);
+}
+
+/// Test distribute_with_override falls back to collaborators when no defaults
+#[test]
+fn test_distribute_with_override_falls_back_to_collaborators() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token, empty_override);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&admin), 500);
+    assert_eq!(TokenClient::new(&env, &token).balance(&b), 500);
+}
+
+/// Test distribute_with_override requires admin auth
+#[test]
+#[should_panic]
+fn test_distribute_with_override_requires_admin_auth() {
+    let env = Env::default();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    env.mock_all_auths();
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    env.mock_auths(&[]);
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token, empty_override);
+}
+
+/// Test distribute_with_override respects pause
+#[test]
+#[should_panic(expected = "contract is paused")]
+fn test_distribute_with_override_respects_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    client.pause();
+
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token, empty_override);
+}
+
+// ── Distribute History Counter Tests ────────────────────────────────────────
+
+/// Test get_distribute_count returns 0 when no distributions
+#[test]
+fn test_get_distribute_count_initially_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    assert_eq!(client.get_distribute_count(), 0);
+}
+
+/// Test get_distribute_count increments on distribute
+#[test]
+fn test_get_distribute_count_increments_on_distribute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    assert_eq!(client.get_distribute_count(), 0);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+    client.distribute(&token);
+
+    assert_eq!(client.get_distribute_count(), 1);
+
+    mint(&env, &token, &contract_id, amount);
+    client.distribute(&token);
+
+    assert_eq!(client.get_distribute_count(), 2);
+}
+
+/// Test get_distribute_count increments on distribute_with_override
+#[test]
+fn test_get_distribute_count_increments_on_distribute_with_override() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    assert_eq!(client.get_distribute_count(), 0);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token, empty_override);
+
+    assert_eq!(client.get_distribute_count(), 1);
+}
+
+/// Test get_distribute_count never decrements
+#[test]
+fn test_get_distribute_count_never_decrements() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+    client.distribute(&token);
+
+    let count_after_first = client.get_distribute_count();
+    assert_eq!(count_after_first, 1);
+
+    client.pause();
+    client.unpause();
+    client.set_royalty_rate(&250);
+
+    assert_eq!(client.get_distribute_count(), 1);
+}
+
+/// Test distribute_history counter overflow safety (saturating arithmetic)
+#[test]
+fn test_distribute_history_overflow_safety() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::DistributeHistory, &u64::MAX);
+    });
+
+    assert_eq!(client.get_distribute_count(), u64::MAX);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+    client.distribute(&token);
+
+    assert_eq!(client.get_distribute_count(), u64::MAX);
+}
+
+// ── Multi-Token Distribution Tests ───────────────────────────────────────────
+
+/// Test distribution works with multiple different token types
+#[test]
+fn test_multi_token_distribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token1 = make_token(&env, &token_admin);
+    let token2 = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount1: i128 = 1000;
+    mint(&env, &token1, &contract_id, amount1);
+    client.distribute(&token1);
+
+    assert_eq!(client.get_distribute_count(), 1);
+    assert_eq!(TokenClient::new(&env, &token1).balance(&admin), 500);
+    assert_eq!(TokenClient::new(&env, &token1).balance(&b), 500);
+
+    let amount2: i128 = 2000;
+    mint(&env, &token2, &contract_id, amount2);
+    client.distribute(&token2);
+
+    assert_eq!(client.get_distribute_count(), 2);
+    assert_eq!(TokenClient::new(&env, &token2).balance(&admin), 1000);
+    assert_eq!(TokenClient::new(&env, &token2).balance(&b), 1000);
+
+    assert_eq!(TokenClient::new(&env, &token1).balance(&admin), 500);
+    assert_eq!(TokenClient::new(&env, &token1).balance(&b), 500);
+}
+
+/// Test distribute_with_override works with multiple tokens
+#[test]
+fn test_multi_token_distribute_with_override() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token1 = make_token(&env, &token_admin);
+    let token2 = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let default1 = Recipient { address: admin.clone(), share: 6000_u32 };
+    let default2 = Recipient { address: b.clone(), share: 4000_u32 };
+    let defaults = vec![&env, default1, default2];
+    client.set_default_recipients(&defaults);
+
+    let amount1: i128 = 1000;
+    mint(&env, &token1, &contract_id, amount1);
+    let override1 = Recipient { address: c.clone(), share: 10000_u32 };
+    let overrides = vec![&env, override1];
+    client.distribute_with_override(&token1, overrides);
+
+    assert_eq!(TokenClient::new(&env, &token1).balance(&c), 1000);
+
+    let amount2: i128 = 2000;
+    mint(&env, &token2, &contract_id, amount2);
+    let empty_override: Vec<Recipient> = vec![&env];
+    client.distribute_with_override(&token2, empty_override);
+
+    assert_eq!(TokenClient::new(&env, &token2).balance(&admin), 1200);
+    assert_eq!(TokenClient::new(&env, &token2).balance(&b), 800);
+}
+
+// ── Backward Compatibility Tests ─────────────────────────────────────────────
+
+/// Test original distribute() function still works (backward compatibility)
+#[test]
+fn test_backward_compatibility_original_distribute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    let amount: i128 = 1000;
+    mint(&env, &token, &contract_id, amount);
+
+    client.distribute(&token);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&admin), 500);
+    assert_eq!(TokenClient::new(&env, &token).balance(&b), 500);
+    assert_eq!(client.get_distribute_count(), 1);
+}
+
+/// Test existing functionality preserved after changes
+#[test]
+fn test_existing_functionality_preserved() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = make_token(&env, &token_admin);
+
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    client.pause();
+    assert!(client.is_paused());
+    client.unpause();
+    assert!(!client.is_paused());
+
+    client.update_share(&admin, &6000_u32);
+    assert_eq!(client.get_share(&admin), 6000);
+    assert_eq!(client.get_share(&b), 4000);
+
+    let pool_amount: i128 = 500;
+    mint(&env, &token, &admin, pool_amount);
+    client.record_secondary_royalty(&token, &admin, &pool_amount);
+    assert_eq!(client.get_secondary_pool(), 500);
+}
