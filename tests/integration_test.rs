@@ -5,7 +5,7 @@ use soroban_sdk::{
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, IntoVal, Map, Vec as SorobanVec,
 };
-use stellar_royalty_splitter::{DataKey, RoyaltySplitterClient};
+use stellar_royalty_splitter::{auth, DataKey, RoyaltySplitterClient, StorageKey};
 
 fn setup(env: &Env) -> (Address, RoyaltySplitterClient) {
     let contract_id = env.register_contract(None, stellar_royalty_splitter::RoyaltySplitter);
@@ -1506,4 +1506,73 @@ fn test_existing_functionality_preserved() {
     mint(&env, &token, &admin, pool_amount);
     client.record_secondary_royalty(&token, &admin, &pool_amount);
     assert_eq!(client.get_secondary_pool(), 500);
+}
+
+// ── Issue #266: typed storage key isolation ─────────────────────────────────
+
+/// Issue #266 — distinct `StorageKey` variants do not share storage slots.
+#[test]
+fn test_storage_key_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    assert_eq!(client.get_share(&admin), 5000);
+    assert_eq!(client.get_share(&b), 5000);
+    assert!(!client.is_paused());
+
+    // Overwrite Paused without touching ShareMap.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&StorageKey::Paused, &true);
+    });
+
+    assert!(client.is_paused());
+    assert_eq!(client.get_share(&admin), 5000);
+    assert_eq!(client.get_total_shares(), 10_000);
+
+    // DataKey alias must match StorageKey serialization.
+    env.as_contract(&contract_id, || {
+        let via_alias: u32 = env.storage().instance().get(&DataKey::RoyaltyRate).unwrap_or(0);
+        assert_eq!(via_alias, 0);
+        env.storage().instance().set(&StorageKey::RoyaltyRate, &250_u32);
+    });
+    assert_eq!(client.get_royalty_rate(), 250);
+}
+
+// ── Issue #267: descriptive auth context ────────────────────────────────────
+
+/// Issue #267 — auth helpers expose function-specific context strings.
+#[test]
+fn test_auth_message_constants_include_function_context() {
+    assert!(auth::msg::INITIALIZE_ADMIN.contains("initialize"));
+    assert!(auth::msg::SET_ROYALTY_RATE_ADMIN.contains("set_royalty_rate"));
+    assert!(auth::msg::DISTRIBUTE_OVERRIDE_ADMIN.contains("distribute_with_override"));
+    assert!(auth::msg::RECORD_SECONDARY_PAYER.contains("record_secondary_royalty"));
+    assert!(auth::msg::INITIALIZE_ADMIN.contains("authorization required"));
+}
+
+/// Issue #267 — successful admin calls publish `auth_req` diagnostic context.
+#[test]
+fn test_auth_req_event_emitted_on_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin, b], &vec![&env, 5000_u32, 5000_u32]);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_cid, topics, _data)| {
+        topics
+            == vec![
+                &env,
+                symbol_short!("auth_req").into_val(&env),
+            ]
+    });
+    assert!(found, "auth_req event should be published before require_auth succeeds");
 }
