@@ -6,7 +6,8 @@ use soroban_sdk::{
     vec, Address, BytesN, Env, IntoVal, Map, String, TryFromVal, Val, Vec as SorobanVec,
 };
 use stellar_royalty_splitter::{
-    auth, DataKey, Recipient, RoyaltySplitterClient, StorageKey, MIN_TTL, VERSION,
+    auth, DataKey, Recipient, RoyaltyRateChange, RoyaltySplitterClient, StorageKey, MIN_TTL,
+    RATE_HISTORY_CAP, VERSION,
 };
 
 fn setup(env: &Env) -> (Address, RoyaltySplitterClient) {
@@ -2913,4 +2914,138 @@ fn test_set_admins_rejects_empty_list() {
 
     let result = client.try_set_admins(&vec![&env], &1);
     assert!(result.is_err(), "empty admin list must be rejected");
+}
+
+// ── Issue #323: set_royalty_rate history log ──────────────────────────────────
+
+#[test]
+fn test_rate_history_empty_before_first_change() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    assert_eq!(client.get_royalty_rate_history().len(), 0);
+}
+
+#[test]
+fn test_rate_history_records_entry_on_set() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    client.set_royalty_rate(&500_u32);
+
+    let history = client.get_royalty_rate_history();
+    assert_eq!(history.len(), 1);
+
+    let entry = history.get(0).unwrap();
+    assert_eq!(entry.old_rate, 0);
+    assert_eq!(entry.new_rate, 500);
+    assert_eq!(entry.timestamp, 1_000_000);
+    assert_eq!(entry.caller, admin);
+}
+
+#[test]
+fn test_rate_history_records_consecutive_changes() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 100);
+    client.set_royalty_rate(&200_u32);
+
+    env.ledger().with_mut(|l| l.timestamp = 200);
+    client.set_royalty_rate(&400_u32);
+
+    env.ledger().with_mut(|l| l.timestamp = 300);
+    client.set_royalty_rate(&600_u32);
+
+    let history = client.get_royalty_rate_history();
+    assert_eq!(history.len(), 3);
+
+    let e0 = history.get(0).unwrap();
+    assert_eq!(e0.old_rate, 0);
+    assert_eq!(e0.new_rate, 200);
+    assert_eq!(e0.timestamp, 100);
+
+    let e1 = history.get(1).unwrap();
+    assert_eq!(e1.old_rate, 200);
+    assert_eq!(e1.new_rate, 400);
+    assert_eq!(e1.timestamp, 200);
+
+    let e2 = history.get(2).unwrap();
+    assert_eq!(e2.old_rate, 400);
+    assert_eq!(e2.new_rate, 600);
+    assert_eq!(e2.timestamp, 300);
+}
+
+#[test]
+fn test_rate_history_capped_at_limit() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (_, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+
+    // Write CAP + 3 entries — history must never exceed RATE_HISTORY_CAP
+    let total = RATE_HISTORY_CAP + 3;
+    for i in 1..=total {
+        // Alternate between two valid rates so old_rate != new_rate every call
+        let rate = if i % 2 == 0 { 100_u32 } else { 200_u32 };
+        env.ledger().with_mut(|l| l.timestamp = i as u64 * 10);
+        client.set_royalty_rate(&rate);
+    }
+
+    let history = client.get_royalty_rate_history();
+    assert_eq!(
+        history.len(),
+        RATE_HISTORY_CAP,
+        "history must be capped at RATE_HISTORY_CAP"
+    );
+
+    // Oldest entry dropped — first remaining entry should reflect change (total - CAP + 1)
+    let first = history.get(0).unwrap();
+    let expected_ts = (total - RATE_HISTORY_CAP + 1) as u64 * 10;
+    assert_eq!(
+        first.timestamp, expected_ts,
+        "oldest entry should have been evicted"
+    );
+}
+
+#[test]
+fn test_rate_history_in_persistent_storage() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (contract_id, client) = setup(&env);
+
+    let admin = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone(), b.clone()], &vec![&env, 5000_u32, 5000_u32]);
+    client.set_royalty_rate(&300_u32);
+
+    env.as_contract(&contract_id, || {
+        let h: SorobanVec<RoyaltyRateChange> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoyaltyRateHistory)
+            .expect("history must be in persistent storage");
+        assert_eq!(h.len(), 1);
+        // Must NOT be in instance storage
+        assert!(!env.storage().instance().has(&DataKey::RoyaltyRateHistory));
+    });
 }

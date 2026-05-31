@@ -14,6 +14,16 @@ pub struct Recipient {
     pub share: u32,
 }
 
+/// One entry in the royalty rate change history (#323).
+#[contracttype]
+#[derive(Clone)]
+pub struct RoyaltyRateChange {
+    pub old_rate: u32,
+    pub new_rate: u32,
+    pub timestamp: u64,
+    pub caller: Address,
+}
+
 /// Typed storage keys.
 ///
 /// Instance storage keys: small, frequently accessed values (Admin, Paused, etc.).
@@ -40,7 +50,12 @@ pub enum StorageKey {
     Collaborators,
     ShareMap,
     DefaultRecipients,
+    RoyaltyRateHistory,
 }
+
+/// Maximum number of rate-change entries kept in history.
+/// Older entries are dropped when the cap is reached.
+pub const RATE_HISTORY_CAP: u32 = 20;
 
 /// Backward-compatible alias for integration tests and external references.
 pub type DataKey = StorageKey;
@@ -168,12 +183,63 @@ impl RoyaltySplitter {
             panic!("royalty rate cannot exceed 10000 basis points");
         }
 
+        // Read old rate before overwriting — 0 means never set.
+        let old_rate: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::RoyaltyRate)
+            .unwrap_or(0);
+
         storage::instance_set(&env, &StorageKey::RoyaltyRate, &new_rate);
+
+        // Append to capped history in persistent storage (#323).
+        // Gas note: one persistent read + write per call; capped at RATE_HISTORY_CAP
+        // entries (~20 × ~80 bytes) so storage growth is bounded.
+        let caller: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("contract not initialized");
+
+        let mut history: Vec<RoyaltyRateChange> =
+            storage::persistent_get::<Vec<RoyaltyRateChange>>(&env, &StorageKey::RoyaltyRateHistory)
+                .unwrap_or(Vec::new(&env));
+
+        if history.len() >= RATE_HISTORY_CAP {
+            // Drop the oldest entry to keep the vec at the cap.
+            let mut trimmed: Vec<RoyaltyRateChange> = Vec::new(&env);
+            for i in 1..history.len() {
+                trimmed.push_back(history.get(i).unwrap());
+            }
+            history = trimmed;
+        }
+
+        history.push_back(RoyaltyRateChange {
+            old_rate,
+            new_rate,
+            timestamp: env.ledger().timestamp(),
+            caller,
+        });
+
+        storage::persistent_set(&env, &StorageKey::RoyaltyRateHistory, &history);
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("rate_set")),
             new_rate,
         );
+    }
+
+    /// Returns the on-chain history of royalty rate changes, oldest first.
+    ///
+    /// Each entry contains the old rate, new rate, block timestamp, and the
+    /// admin address that made the change. Capped at [`RATE_HISTORY_CAP`]
+    /// entries — once full, the oldest entry is dropped on each new change.
+    ///
+    /// Returns an empty vec if `set_royalty_rate` has never been called.
+    pub fn get_royalty_rate_history(env: Env) -> Vec<RoyaltyRateChange> {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get::<Vec<RoyaltyRateChange>>(&env, &StorageKey::RoyaltyRateHistory)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Pause the contract — halts `distribute` and `distribute_secondary_royalties`.
