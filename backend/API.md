@@ -62,7 +62,37 @@ Build an unsigned `distribute` transaction XDR.
 
 **Body:** `{ contractId, walletAddress, tokenId }`
 
+**Headers (optional):**
+- `Idempotency-Key`: String (1-255 alphanumeric characters, hyphens, or underscores). When provided, prevents duplicate transaction submissions within a 24-hour window. If the same key is used within the window, returns the cached response instead of creating a new transaction.
+
 **Response:** `{ xdr, transactionId }`
+
+**Idempotency:**
+
+The distribute endpoint supports idempotency to prevent duplicate transaction submissions caused by network timeouts or client retries. When an `Idempotency-Key` header is provided:
+
+1. The first request with a given key processes normally and caches the response
+2. Subsequent requests with the same key within 24 hours return the cached response
+3. Cached responses are automatically expired after 24 hours
+4. Only successful responses (2xx status codes) are cached
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3001/api/v1/distribute \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: dist-abc-123" \
+  -d '{"contractId":"C...","walletAddress":"G...","tokenId":"C..."}'
+```
+
+If the request times out and is retried with the same `Idempotency-Key`, the second request will return the same `xdr` and `transactionId` without creating a duplicate transaction.
+
+**Configuration:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `IDEMPOTENCY_CACHE_TTL_MS` | `86400000` (24 hours) | How long to cache idempotent responses |
+| `IDEMPOTENCY_MAX_ENTRIES` | `10000` | Maximum number of cached responses before eviction |
 
 ## Simulate Distribution
 
