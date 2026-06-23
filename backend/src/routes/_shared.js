@@ -14,12 +14,13 @@ export async function buildAndRecordTransaction({
   contractId,
   walletAddress,
   transactionType,
+  contractMethod,
   scvlArgs,
   auditAction,
   auditMetadata,
   transactionMetadata = {},
 }) {
-  // Record transaction in database for audit trail
+  const method = contractMethod ?? transactionType;
   const transactionId = recordTransaction(
     contractId,
     transactionType,
@@ -27,8 +28,7 @@ export async function buildAndRecordTransaction({
     transactionMetadata
   );
 
-  // Build the transaction XDR
-  const txXdr = await retryBuildTx(walletAddress, contractId, transactionType, scvlArgs);
+  const txXdr = await retryBuildTx(walletAddress, contractId, method, scvlArgs);
 
   // Log the audit event
   addAuditLog(contractId, auditAction, walletAddress, {

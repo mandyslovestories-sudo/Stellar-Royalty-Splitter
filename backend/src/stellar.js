@@ -566,6 +566,14 @@ export function u32ToScVal(n) {
   return xdr.ScVal.scvU32(n);
 }
 
+export function bytesN32HexToScVal(hex) {
+  const buf = Buffer.from(hex, "hex");
+  if (buf.length !== 32) {
+    throw new Error("Expected 32-byte hex value");
+  }
+  return xdr.ScVal.scvBytes(buf);
+}
+
 export function i128ToScVal(n) {
   return nativeToScVal(BigInt(n), { type: "i128" });
 }

@@ -1,8 +1,8 @@
 import express from "express";
 import db from "../database/index.js";
 import logger from "../logger.js";
-import { validateContractIdMiddleware } from "../validation.js";
-import { sendError } from "../error-response.js";
+import { validateContractIdMiddleware, analyticsQuerySchema } from "../validation.js";
+import { sendError, sendValidationError } from "../error-response.js";
 
 // Simple in-memory cache with TTL
 const cache = new Map();
@@ -12,7 +12,19 @@ const router = express.Router();
 
 router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) => {
   const { contractId } = req.params;
-  const { start, end } = req.query;
+
+  const queryResult = analyticsQuerySchema.safeParse(req.query);
+  if (!queryResult.success) {
+    return sendValidationError(
+      res,
+      queryResult.error.issues.map((e) => ({
+        field: e.path.join(".") || "query",
+        message: e.message,
+      }))
+    );
+  }
+
+  const { start, end, collaboratorLimit = 10 } = queryResult.data;
 
   try {
     // Parse date range
@@ -98,9 +110,10 @@ router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) =>
         WHERE t.contractId = ? AND t.status = 'confirmed'
           AND t.timestamp BETWEEN ? AND ?
         GROUP BY dp.collaboratorAddress
-        ORDER BY totalEarned DESC`
+        ORDER BY totalEarned DESC
+        LIMIT ?`
       )
-      .all(contractId, startDate.toISOString(), endDate.toISOString());
+      .all(contractId, startDate.toISOString(), endDate.toISOString(), collaboratorLimit);
 
     const data = {
       success: true,

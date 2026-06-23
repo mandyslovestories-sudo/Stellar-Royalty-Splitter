@@ -45,6 +45,29 @@ Configure the default contract with `ROYALTY_CONTRACT_ID` or `CONTRACT_ID`. Resp
 
 Legacy `/api/*` paths redirect to `/api/v1/*`.
 
+## Request signing (#392)
+
+Write operations (`POST`, `PUT`, `DELETE`) may require Ed25519 request signatures when `REQUEST_SIGNING_REQUIRED=true`.
+
+**Headers:**
+
+| Header | Description |
+| ------ | ----------- |
+| `X-Wallet-Address` | Stellar `G...` address of the signer |
+| `X-Timestamp` | Unix epoch seconds (max age 5 minutes) |
+| `X-Nonce` | Unique UUID per request (replay protection) |
+| `X-Signature` | Base64 Ed25519 signature |
+
+**Canonical message:**
+
+```
+METHOD\nPATH\nTIMESTAMP\nNONCE\nSHA256_HEX(body)
+```
+
+Example path: `/api/v1/initialize`. Unsigned requests are allowed when signing is not required (default in development).
+
+Invalid or missing signatures return `401`.
+
 ## Initialize
 
 ### `POST /api/v1/initialize`
@@ -72,6 +95,22 @@ Collaborator-specific payload limit responses use:
   "error": "Collaborators payload too large"
 }
 ```
+
+### `POST /api/v1/initialize/commit` (#403)
+
+Commit-reveal phase 1 — stores hashed collaborator/share data on-chain.
+
+**Body:** `{ contractId, walletAddress, collaboratorsHash, sharesHash, nonce }` (64-char hex strings)
+
+**Response:** `{ xdr, transactionId, phase: "commit" }`
+
+### `POST /api/v1/initialize/reveal` (#403)
+
+Commit-reveal phase 2 — reveals collaborators and initializes after ≥1 ledger delay.
+
+**Body:** `{ contractId, walletAddress, collaborators, shares, salt }`
+
+**Response:** `{ xdr, transactionId, phase: "reveal" }`
 
 ## Distribute
 
@@ -254,8 +293,52 @@ See route module `src/routes/secondary-royalty.js` for pool, sales, and distribu
 
 ## History & analytics
 
-- `GET /api/v1/history/:contractId`
-- `GET /api/v1/analytics/:contractId`
+### `GET /api/v1/history/:contractId`
+
+Paginated transaction history for a contract.
+
+**Query parameters:**
+
+| Param | Type | Default | Constraints |
+| ----- | ---- | ------- | ----------- |
+| `limit` | integer | `10` | `1`–`100` |
+| `offset` | integer | `0` | `0`–`1000000` |
+
+Invalid pagination returns `400` with validation details.
+
+**Example:**
+
+```bash
+curl "http://localhost:3001/api/v1/history/C...?limit=10&offset=0"
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "data": [],
+  "pagination": { "limit": 10, "offset": 0, "total": 0 }
+}
+```
+
+### `GET /api/v1/audit/:contractId`
+
+Paginated audit log. Same `limit` / `offset` constraints as history.
+
+### `GET /api/v1/analytics/:contractId`
+
+Aggregated analytics for a contract.
+
+**Query parameters:**
+
+| Param | Type | Default | Constraints |
+| ----- | ---- | ------- | ----------- |
+| `start` | ISO date | 90 days ago | Valid date string |
+| `end` | ISO date | now | Valid date string |
+| `collaboratorLimit` | integer | `10` | `1`–`100` — caps `collaboratorStats` rows |
+
+**Rate limiting:** History, audit, and analytics endpoints share a dedicated limiter (default 30 req/min per IP) in addition to the general API limiter.
 
 ## Transaction confirmation
 
