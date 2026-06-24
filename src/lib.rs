@@ -88,6 +88,7 @@ pub use storage::MIN_TTL;
 /// between versions — read `get_version()` before invoking version-specific
 /// entrypoints and plan migrations explicitly when redeploying.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const EVENT_VERSION: u32 = 1;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -125,7 +126,6 @@ pub enum ContractError {
 #[contract]
 pub struct RoyaltySplitter;
 
-#[contractimpl]
 impl RoyaltySplitter {
     fn fail(env: &Env, error: ContractError) -> ! {
         soroban_sdk::panic_with_error!(env, error);
@@ -292,7 +292,7 @@ impl RoyaltySplitter {
     }
 
     fn process_batch_token_distribution(env: &Env, token: Address, recipients: &Vec<Recipient>) {
-        let token_client = token::Client::new(env, token);
+        let token_client = token::Client::new(env, &token);
         let amount = token_client.balance(&env.current_contract_address());
 
         if amount == 0 {
@@ -327,12 +327,12 @@ impl RoyaltySplitter {
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
             env.events()
-                .publish((symbol_short!("dist"),), (addr, payout));
+                .publish((symbol_short!("dist"),), (EVENT_VERSION, env.ledger().sequence(), addr, payout));
         }
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("dist_all")),
-            (token.clone(), amount),
+            (EVENT_VERSION, env.ledger().sequence(), token.clone(), amount),
         );
     }
 }
@@ -418,7 +418,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("init")),
-            (collaborators, shares),
+            (EVENT_VERSION, env.ledger().sequence(), collaborators, shares),
         );
     }
 
@@ -458,7 +458,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("rate_set")),
-            new_rate,
+            (EVENT_VERSION, env.ledger().sequence(), new_rate),
         );
 
         // Append to capped history in persistent storage (#323).
@@ -558,7 +558,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("admin_xfr")),
-            (previous_admin, new_admin),
+            (EVENT_VERSION, env.ledger().sequence(), previous_admin, new_admin),
         );
     }
 
@@ -577,7 +577,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("adm_prop")),
-            new_admin,
+            (EVENT_VERSION, env.ledger().sequence(), new_admin),
         );
     }
 
@@ -616,7 +616,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("adm_acc")),
-            (previous_admin, pending),
+            (EVENT_VERSION, env.ledger().sequence(), previous_admin, pending),
         );
     }
 
@@ -715,7 +715,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("default"), symbol_short!("rcpt_set")),
-            recipients.len(),
+            (EVENT_VERSION, env.ledger().sequence(), recipients.len()),
         );
     }
 
@@ -747,7 +747,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("recip_set")),
-            recipients.len(),
+            (EVENT_VERSION, env.ledger().sequence(), recipients.len()),
         );
     }
 
@@ -779,7 +779,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("withdraw")),
-            (token, amount),
+            (EVENT_VERSION, env.ledger().sequence(), token, amount),
         );
     }
 
@@ -916,12 +916,12 @@ impl RoyaltySplitter {
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
             env.events()
-                .publish((symbol_short!("dist"),), (addr, payout));
+                .publish((symbol_short!("dist"),), (EVENT_VERSION, env.ledger().sequence(), addr, payout));
         }
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("dist_all")),
-            (token, amount),
+            (EVENT_VERSION, env.ledger().sequence(), token, amount),
         );
 
         storage::instance_set(
@@ -989,34 +989,14 @@ impl RoyaltySplitter {
 impl RoyaltySplitter {
     /// Distribute royalties for multiple tokens in a single transaction.
     ///
-    /// Executes multiple independent distributions atomically, reducing total
-    /// ledger fees for high-frequency royalty scenarios. Each token distribution
-    /// is processed independently using the same logic as `distribute()`.
+    /// Executes multiple independent token distributions atomically to save gas.
+    /// Uses the default recipient list (or falls back to collaborators).
     ///
     /// # Arguments
-    /// * `tokens` - List of token addresses to distribute (e.g., XLM, USDC, etc.)
-    ///
-    /// # Distribution Logic
-    /// For each token:
-    /// - Uses the default recipient list (or collaborators if no defaults set)
-    /// - Each recipient receives: (token_balance * their_share) / 10,000
-    /// - The last recipient receives any remaining dust from integer division
-    /// - Emits individual distribution events for each token
+    /// * `tokens` - List of token addresses to distribute.
     ///
     /// # Authorization
-    /// Requires admin signature (checked once for the entire batch)
-    ///
-    /// # Panics
-    /// * `"contract not initialized"` — called before `initialize`
-    /// * `"contract is paused"` — contract is currently paused
-    /// * `"recipients list cannot be empty"` — no recipients are configured
-    /// * `"no balance to distribute"` — any token has zero balance
-    /// * `"amount too small"` — any token balance is less than recipient count
-    ///
-    /// # Gas Considerations
-    /// Processing N tokens in one call is more efficient than N separate calls,
-    /// but be mindful of transaction complexity limits. Each distribution performs
-    /// token transfers equal to the number of recipients.
+    /// Requires admin signature (checked once for the batch).
     pub fn batch_distribute(env: Env, tokens: Vec<Address>) {
         Self::batch_distribute_impl(env, tokens);
     }
@@ -1067,7 +1047,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("batch")),
-            tokens.len(),
+            (EVENT_VERSION, env.ledger().sequence(), tokens.len()),
         );
     }
 }
@@ -1235,7 +1215,7 @@ impl RoyaltySplitter {
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
             env.events()
-                .publish((symbol_short!("sec_dist"),), (addr, payout));
+                .publish((symbol_short!("sec_dist"),), (EVENT_VERSION, env.ledger().sequence(), addr, payout));
         }
 
         storage::instance_set(&env, &StorageKey::SecondaryPool, &0_i128);
@@ -1245,7 +1225,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("sec_dist")),
-            (token, pool, dust),
+            (EVENT_VERSION, env.ledger().sequence(), token, pool, dust),
         );
 
         storage::instance_set(
@@ -1402,7 +1382,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("share"), symbol_short!("updated")),
-            (collaborator, new_share),
+            (EVENT_VERSION, env.ledger().sequence(), collaborator, new_share),
         );
     }
 
@@ -1539,7 +1519,7 @@ impl RoyaltySplitter {
 
         env.events().publish(
             (symbol_short!("royalty"), symbol_short!("adms_set")),
-            (admins.len(), threshold),
+            (EVENT_VERSION, env.ledger().sequence(), admins.len(), threshold),
         );
     }
 
