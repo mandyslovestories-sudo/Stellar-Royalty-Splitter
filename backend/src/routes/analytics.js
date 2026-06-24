@@ -1,6 +1,6 @@
 import express from "express";
 import db from "../database/index.js";
-import logger from "../logger.js";
+import { createRequestLogger } from "../logger.js";
 import { validateContractIdMiddleware, analyticsQuerySchema } from "../validation.js";
 import { sendError, sendValidationError } from "../error-response.js";
 
@@ -11,6 +11,7 @@ const CACHE_TTL = 60 * 1000; // 60 seconds
 const router = express.Router();
 
 router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) => {
+  const log = createRequestLogger(req);
   const { contractId } = req.params;
 
   const queryResult = analyticsQuerySchema.safeParse(req.query);
@@ -33,12 +34,15 @@ router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) =>
 
     // Validate parsed dates
     if (start && isNaN(startDate.getTime())) {
+      log.warn("analytics invalid start date", { contractId, start });
       return sendError(res, 400, "invalid_query_parameter", "Invalid start date. Use YYYY-MM-DD.");
     }
     if (end && isNaN(endDate.getTime())) {
+      log.warn("analytics invalid end date", { contractId, end });
       return sendError(res, 400, "invalid_query_parameter", "Invalid end date. Use YYYY-MM-DD.");
     }
     if (start && end && startDate > endDate) {
+      log.warn("analytics start date after end date", { contractId, start, end });
       return sendError(res, 400, "invalid_query_parameter", "start date must be before end date.");
     }
 
@@ -48,12 +52,19 @@ router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) =>
     // Check cache
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      log.debug("analytics cache hit", { contractId, cacheKey });
       res.set("Cache-Control", "max-age=60");
       return res.json(cached.data);
     }
 
-    // Run the same SQL-aggregated analytics that were previously provided
-    // by the database helper. Use the shared `db` instance.
+    log.info("analytics query started", {
+      contractId,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+    });
+
+    const queryStart = Date.now();
+
     const summary = db
       .prepare(
         `SELECT
@@ -115,6 +126,12 @@ router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) =>
       )
       .all(contractId, startDate.toISOString(), endDate.toISOString(), collaboratorLimit);
 
+    log.info("analytics query completed", {
+      contractId,
+      durationMs: Date.now() - queryStart,
+      totalTransactions: summary.totalTransactions,
+    });
+
     const data = {
       success: true,
       data: {
@@ -142,7 +159,11 @@ router.get("/analytics/:contractId", validateContractIdMiddleware, (req, res) =>
     res.set("Cache-Control", "max-age=60");
     res.json(data);
   } catch (error) {
-    logger.error("Analytics error:", error);
+    log.error("analytics query failed", {
+      contractId,
+      error: error.message ?? String(error),
+      stack: error.stack,
+    });
     sendError(res, 500, "analytics_fetch_failed", "Failed to load analytics data");
   }
 });
