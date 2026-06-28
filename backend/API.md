@@ -5,6 +5,27 @@ Base URL: `http://localhost:3001` (default)
 All JSON POST bodies must use `Content-Type: application/json`.
 JSON request bodies are limited to `10kb`; oversized requests return `413 Payload Too Large`.
 
+## Standardized Error Response Format (#227)
+
+All API routes consistently return structured error responses matching the standardized shape:
+
+```json
+{
+  "status": 400,
+  "code": "bad_request",
+  "message": "Human-readable error description",
+  "error": "Human-readable error description",
+  "timestamp": "2026-06-26T14:00:00.000Z"
+}
+```
+
+- `status`: The HTTP status code (integer)
+- `code`: Machine-readable snake_case error code (e.g. `bad_request`, `validation_error`, `conflict`, `payload_too_large`, `internal_server_error`)
+- `message`: Human-readable error message (string)
+- `error`: Maintained alongside `message` for 100% backward compatibility with legacy clients
+
+---
+
 ## Health
 
 ### `GET /api/v1/health`
