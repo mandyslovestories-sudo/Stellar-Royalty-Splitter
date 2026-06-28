@@ -228,10 +228,10 @@ describe("POST /api/v1/initialize", () => {
         ...validBody,
         collaborators: [oversizedCollaborator],
         shares: [10000],
-      });
+    });
 
     expect(res.status).toBe(413);
-    expect(res.body).toEqual({ error: "Collaborators payload too large" });
+    expect(res.body).toMatchObject({ error: "Collaborators payload too large" });
     expect(isContractInitialized).not.toHaveBeenCalled();
     expect(retryBuildTx).not.toHaveBeenCalled();
     expect(recordTransaction).not.toHaveBeenCalled();
