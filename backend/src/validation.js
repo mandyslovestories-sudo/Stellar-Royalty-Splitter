@@ -80,6 +80,14 @@ export const distributeSecondarySchema = z.object({
   contractId: contractAddress,
   walletAddress: stellarAddress,
   tokenId: contractAddress,
+  collaborators: z
+    .array(
+      z.object({
+        address: stellarAddress,
+        basisPoints: basisPoints,
+      })
+    )
+    .optional(),
 });
 
 export const webhookRegisterSchema = z.object({

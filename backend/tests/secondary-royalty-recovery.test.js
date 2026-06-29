@@ -109,7 +109,7 @@ describe("Secondary Royalty Error Recovery Tests", () => {
     const res = await request(app).post("/api/v1/secondary-royalty/distribute").send(VALID_BODY);
 
     expect(res.status).toBe(503);
-    expect(res.body.error).toMatch(/distribution_failed_retry_queued/);
+    expect(res.body.code).toBe("distribution_failed_retry_queued");
     expect(addToRetryQueue).toHaveBeenCalledWith(
       expect.objectContaining({
         contractId: CONTRACT,
@@ -206,7 +206,7 @@ describe("Secondary Royalty Error Recovery Tests", () => {
       ...VALID_BODY,
       collaborators: [
         { address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", basisPoints: 6000 },
-        { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", basisPoints: 4000 },
+        { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", basisPoints: 4000 },
       ],
     };
 
@@ -227,7 +227,7 @@ describe("Secondary Royalty Error Recovery Tests", () => {
 
     const dustAllocations = [
       { address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", amount: 150n, dustReceived: 1n },
-      { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", amount: 149n, dustReceived: 0n },
+      { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", amount: 149n, dustReceived: 0n },
     ];
 
     applyLargestRemainder.mockReturnValue(dustAllocations);
@@ -236,7 +236,7 @@ describe("Secondary Royalty Error Recovery Tests", () => {
       ...VALID_BODY,
       collaborators: [
         { address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", basisPoints: 5000 },
-        { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", basisPoints: 5000 },
+        { address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", basisPoints: 5000 },
       ],
     };
 

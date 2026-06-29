@@ -36,6 +36,10 @@ const getSecondaryRoyaltyDistributions = jest.fn();
 const countSecondarySales = jest.fn();
 const initializeDatabase = jest.fn();
 const getMigrationVersion = jest.fn(() => 7);
+const addToRetryQueue = jest.fn();
+const getRetryQueueStats = jest.fn(() => ({ count: 0 }));
+const getDeadLetterQueueStats = jest.fn(() => ({ count: 0 }));
+const getDeadLetterItems = jest.fn(() => []);
 
 await jest.unstable_mockModule("../src/database/index.js", () => ({
   getSecondarySales,
@@ -49,6 +53,10 @@ await jest.unstable_mockModule("../src/database/index.js", () => ({
   countSecondarySales,
   initializeDatabase,
   getMigrationVersion,
+  addToRetryQueue,
+  getRetryQueueStats,
+  getDeadLetterQueueStats,
+  getDeadLetterItems,
 }));
 
 // --- Build test app after mocks ------------------------------------------
@@ -112,7 +120,7 @@ describe("POST /api/v1/secondary-royalty/distribute — atomic DB commit (#471)"
 
     const res = await request(app).post("/api/v1/secondary-royalty/distribute").send(VALID_BODY);
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(503);
     // The atomic commit must NEVER be called when buildTx fails
     expect(commitSecondaryDistributionAtomic).not.toHaveBeenCalled();
   });
