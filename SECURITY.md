@@ -112,6 +112,39 @@ The following components are in scope for security research:
 - Keep the Stellar CLI and all dependencies up to date.
 - Review the `SECURITY_AUDIT.md` in this repository for known findings and their mitigations.
 
+### Secrets Manager Configuration (Production)
+
+The backend supports loading signing keys from encrypted secrets stores:
+
+**AWS Secrets Manager:**
+```bash
+SECRETS_PROVIDER=aws
+AWS_SECRET_NAME=stellar-signing-key
+AWS_REGION=us-east-1
+SECRETS_ENCRYPTION_KEY=your-32-char-encryption-key
+```
+
+**HashiCorp Vault:**
+```bash
+SECRETS_PROVIDER=vault
+VAULT_ADDR=https://vault.example.com:8200
+VAULT_TOKEN=hvs.your-token
+VAULT_SECRET_PATH=secret/data/signing-key
+SECRETS_ENCRYPTION_KEY=your-32-char-encryption-key
+```
+
+**Local Development (Plaintext Fallback):**
+```bash
+# File-based
+SIGNING_KEY_FILE=/path/to/key.txt
+
+# Or environment variable
+SERVER_SECRET_KEY=SAAAA...
+```
+
+The secrets manager automatically detects the configured provider and loads the key on startup.
+Secrets are encrypted at rest when `SECRETS_ENCRYPTION_KEY` is configured.
+
 ---
 
 ## Supported Versions

@@ -30,10 +30,27 @@ export class BackendApiError extends Error {
   }
 }
 
-function readErrorBody(status: number, data: unknown): BackendApiError {
-  const parsed = extractContractError(data ?? { error: "Request failed" });
-  return new BackendApiError(status, parsed.code, parsed.message, parsed.details);
-}
+async function post<T>(
+  path: string,
+  body: unknown,
+  walletAddress?: string,
+  extraHeaders?: Record<string, string>,
+): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+  if (walletAddress && typeof body === "object" && body !== null) {
+    const signingHeaders = await signWriteRequest({
+      method: "POST",
+      path: `${BASE}${path}`,
+      body,
+      walletAddress,
+    });
+    Object.assign(headers, signingHeaders);
+  }
+
+  if (extraHeaders) {
+    Object.assign(headers, extraHeaders);
+  }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const requestPath = `${BASE}${path}`;
@@ -49,16 +66,18 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
-  if (!res.ok) throw readErrorBody(res.status, data);
-  return data as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
-  const data = await res.json();
-  if (!res.ok) throw readErrorBody(res.status, data);
-  return data as T;
+/**
+ * Generate a fresh idempotency key for retry-safe POST requests.
+ * Generate once per user action, then pass the same key on every retry.
+ */
+export function generateIdempotencyKey(): string {
+  return crypto.randomUUID();
+}
+
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, signal ? { signal } : undefined);
 }
 
 export interface TransactionRecord {
@@ -92,6 +111,14 @@ export interface AuditLogEntry {
   timestamp: string;
 }
 
+export interface CollaboratorSuggestion {
+  address: string;
+  label: string;
+  contractId: string | null;
+  lastSeen: string | null;
+  sources: string[];
+}
+
 export interface SecondarySale {
   id: number;
   nftId: string;
@@ -115,20 +142,85 @@ export interface RoyaltyStats {
   } | null;
 }
 
+// #504: contract pause state for the distribution UI banner.
+export interface PauseState {
+  paused: boolean;
+  pauseTimestamp: number;
+  pauseSource: string | null;
+  remainingSeconds: number;
+}
+
+export type ContractStateCacheStatus = "cached" | "live" | "error";
+
+export interface ContractState {
+  contractId: string;
+  adminAddress: string | null;
+  royaltyRate: number;
+  recipients: Array<{ address: string; basisPoints: number }>;
+  balance: string;
+  tokenId: string;
+  network: string;
+  networkPassphrase?: string;
+  cacheStatus: Exclude<ContractStateCacheStatus, "error">;
+  cacheTtlMs: number;
+  fetchedAt: string;
+}
+
 export const api = {
   initialize: (body: {
     contractId: string;
     walletAddress: string;
     collaborators: string[];
     shares: number[];
-  }) => post<{ xdr: string; transactionId: number }>("/initialize", body),
+    nonce?: string;
+  }) =>
+    post<{ xdr: string; transactionId: number }>(
+      "/initialize",
+      body,
+      body.walletAddress,
+    ),
 
-  distribute: (body: {
+  commitInitialize: (body: {
     contractId: string;
     walletAddress: string;
-    tokenId: string;
-    amount: number;
-  }) => post<{ xdr: string; transactionId: number }>("/distribute", body),
+    collaboratorsHash: string;
+    sharesHash: string;
+    nonce: string;
+  }) =>
+    post<{ xdr: string; transactionId: number; phase: string }>(
+      "/initialize/commit",
+      body,
+      body.walletAddress,
+    ),
+
+  revealInitialize: (body: {
+    contractId: string;
+    walletAddress: string;
+    collaborators: string[];
+    shares: number[];
+    salt: string;
+  }) =>
+    post<{ xdr: string; transactionId: number; phase: string }>(
+      "/initialize/reveal",
+      body,
+      body.walletAddress,
+    ),
+
+  distribute: (
+    body: {
+      contractId: string;
+      walletAddress: string;
+      tokenId: string;
+      amount?: number;
+    },
+    idempotencyKey?: string,
+  ) =>
+    post<{ xdr: string; transactionId: number }>(
+      "/distribute",
+      body,
+      body.walletAddress,
+      idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+    ),
 
   getContractBalance: (contractId: string, tokenId: string) =>
     get<{ balance: string }>(
@@ -140,6 +232,11 @@ export const api = {
       `/collaborators/${contractId}`,
     ),
 
+  lookupCollaborators: (query = "", limit = 10) =>
+    get<{ suggestions: CollaboratorSuggestion[] }>(
+      `/collaborators/lookup?q=${encodeURIComponent(query)}&limit=${limit}`,
+    ),
+
   // Transaction History & Audit Log APIs
   getTransactionHistory: (contractId: string, limit = 50, offset = 0) =>
     get<{
@@ -148,9 +245,10 @@ export const api = {
       pagination: { limit: number; offset: number; total: number };
     }>(`/history/${contractId}?limit=${limit}&offset=${offset}`),
 
-  getTransactionDetails: (txHash: string) =>
+  getTransactionDetails: (txHash: string, signal?: AbortSignal) =>
     get<{ success: boolean; data: TransactionDetails }>(
       `/transaction/${txHash}`,
+      signal,
     ),
 
   confirmTransaction: (
@@ -159,11 +257,14 @@ export const api = {
       status: "pending" | "confirmed" | "failed";
       blockTime?: string;
       errorMessage?: string;
+      transactionId?: number;
     },
+    walletAddress?: string,
   ) =>
     post<{ success: boolean; message: string }>(
       `/transaction/confirm/${txHash}`,
       body,
+      walletAddress,
     ),
 
   getAuditLog: (contractId: string, limit = 100, offset = 0) =>
@@ -179,7 +280,11 @@ export const api = {
       details?: Record<string, unknown>;
     },
   ) =>
-    post<{ success: boolean; message: string }>(`/audit/${contractId}`, body),
+    post<{ success: boolean; message: string }>(
+      `/audit/${contractId}`,
+      body,
+      body.user,
+    ),
 
   // Secondary Royalty APIs
   recordSecondarySale: (body: {
@@ -195,6 +300,7 @@ export const api = {
     post<{ xdr: string; transactionId: number; royaltyAmount: number }>(
       "/secondary-royalty",
       body,
+      body.walletAddress,
     ),
 
   setRoyaltyRate: (body: {
@@ -205,19 +311,28 @@ export const api = {
     post<{ xdr: string; transactionId: number }>(
       "/secondary-royalty/set-rate",
       body,
+      body.walletAddress,
     ),
 
-  distributeSecondaryRoyalties: (body: {
-    contractId: string;
-    walletAddress: string;
-    tokenId: string;
-  }) =>
+  distributeSecondaryRoyalties: (
+    body: {
+      contractId: string;
+      walletAddress: string;
+      tokenId: string;
+    },
+    idempotencyKey?: string,
+  ) =>
     post<{
       xdr: string;
       transactionId: number;
       numberOfSales: number;
       totalRoyalties: string;
-    }>("/secondary-royalty/distribute", body),
+    }>(
+      "/secondary-royalty/distribute",
+      body,
+      body.walletAddress,
+      idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+    ),
 
   getRoyaltyStats: (contractId: string) =>
     get<RoyaltyStats>(`/secondary-royalty/stats/${contractId}`),
@@ -262,7 +377,22 @@ export const api = {
     get<{ initialized: boolean }>(`/contract/status/${contractId}`),
 
   getContractVersion: (contractId: string) =>
-    get<{ contractId: string; version: string }>(`/contract/version/${contractId}`),
+    get<{ contractId: string; version: string }>(
+      `/contract/version/${contractId}`,
+    ),
+
+  // #504: Fetch the contract's pause state so the UI can warn and block.
+  getPauseState: (contractId: string) =>
+    get<PauseState>(`/contract/pause/${contractId}`),
+
+  getContractState: (
+    contractId: string,
+    options: { bypassCache?: boolean } = {},
+  ) => {
+    const params = new URLSearchParams({ contractId });
+    if (options.bypassCache) params.set("cache", "false");
+    return get<ContractState>(`/contract/state?${params.toString()}`);
+  },
 
   // NEW: Fetch royalty rate from contract
   getRoyaltyRate: (contractId: string) =>

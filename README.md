@@ -92,9 +92,40 @@ cargo build --target wasm32-unknown-unknown --release
 
 ## Test
 
+### Backend Tests (Node.js)
+
+```bash
+cd backend
+npm test
+```
+
+**Status:** ✅ **152/152 tests passing (100%)**
+
+### Frontend Unit Tests
+
+```bash
+cd frontend
+npm run test:coverage
+```
+
+**Status:** ✅ Vitest + RTL configured, unit tests for core components.
+
+### Frontend E2E Tests
+
+```bash
+cd frontend
+npm run test:e2e
+```
+
+**Status:** 📋 18 tests configured (requires Playwright browsers)
+
+### Rust Contract Tests
+
 ```bash
 cargo test
 ```
+
+**Status:** ❓ Requires Rust toolchain
 
 ---
 
@@ -260,6 +291,12 @@ npm run dev            # → http://localhost:5173
 The frontend proxies `/api/*` to the backend automatically via the Vite config.
 
 The backend builds unsigned transaction XDR and returns it to the frontend. **Freighter signs and submits client-side — your private key never leaves the browser.**
+
+---
+
+### Backend shutdown
+
+The backend handles `SIGTERM` and `SIGINT` gracefully. On shutdown it stops accepting new HTTP connections, lets in-flight API requests finish through Node's `server.close()` drain behavior, checkpoints and closes the SQLite database, logs each shutdown step, and then exits. No additional shutdown timeout is configured, so container or process managers should provide any external termination deadline they require.
 
 ---
 
