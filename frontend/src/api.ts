@@ -1,64 +1,10 @@
 // Thin client that talks to the Express backend
 
-import { signWriteRequest } from "./lib/request-signing";
+import { extractContractError } from "./lib/contract-errors";
+import { createSignedRequestHeaders } from "./request-signing";
+export { setRequestSigningSecret } from "./request-signing";
 
 const BASE = "/api/v1";
-export const SESSION_EXPIRED_EVENT = "srs:session-expired";
-const SESSION_EXPIRED_MESSAGE =
-  "Your session has expired. Please connect your wallet again.";
-
-let sessionExpiryNotified = false;
-
-function notifySessionExpired() {
-  if (sessionExpiryNotified || typeof window === "undefined") return;
-  sessionExpiryNotified = true;
-  window.dispatchEvent(
-    new CustomEvent(SESSION_EXPIRED_EVENT, {
-      detail: { message: SESSION_EXPIRED_MESSAGE },
-    }),
-  );
-}
-
-async function readJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function getErrorMessage(data: unknown, status: number) {
-  if (
-    data &&
-    typeof data === "object" &&
-    "error" in data &&
-    typeof data.error === "string"
-  ) {
-    return data.error;
-  }
-
-  return `Request failed (${status})`;
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
-  const data = await readJson(res);
-
-  if (res.status === 401) {
-    notifySessionExpired();
-    throw new Error(SESSION_EXPIRED_MESSAGE);
-  }
-
-  if (res.ok) {
-    sessionExpiryNotified = false;
-    return data as T;
-  }
-
-  throw new Error(getErrorMessage(data, res.status));
-}
 
 // #279: surface a structured `code + message + details` shape from
 // the backend's error response instead of just `data.error`. The
@@ -106,9 +52,18 @@ async function post<T>(
     Object.assign(headers, extraHeaders);
   }
 
-  return request<T>(path, {
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const requestPath = `${BASE}${path}`;
+  const res = await fetch(requestPath, {
     method: "POST",
-    headers,
+    headers: {
+      "Content-Type": "application/json",
+      ...createSignedRequestHeaders({
+        method: "POST",
+        path: requestPath,
+        body,
+      }),
+    },
     body: JSON.stringify(body),
   });
 }
