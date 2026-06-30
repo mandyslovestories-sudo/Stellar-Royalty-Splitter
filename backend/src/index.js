@@ -7,6 +7,8 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import logger from "./logger.js";
 import { correlationMiddleware } from "./correlation.js";
+import { transactionTrackingMiddleware } from "./transaction-tracking.js";
+import { transactionRouter } from "./routes/transaction.js";
 import { recordHttpRequest } from "./metrics.js";
 import { resolveCorsOrigin } from "./cors-config.js";
 import { initializeRouter } from "./routes/initialize.js";
@@ -19,6 +21,7 @@ import webhooksRouter from "./routes/webhooks.js";
 import { analyticsRouter } from "./routes/analytics.js";
 import { contractRouter } from "./routes/contract.js";
 import { healthRouter } from "./routes/health.js";
+import { tracesRouter } from "./routes/traces.js";
 import { closeDatabase, initializeDatabase, verifyAuditLogOnStartup } from "./database/index.js";
 import { createGracefulShutdownHandler } from "./shutdown.js";
 import { adminRouter } from "./routes/admin.js";
@@ -32,7 +35,16 @@ import { createLegacyApiRedirectMiddleware } from "./legacy-api-redirect.js";
 // #399: Cache and event listener imports
 import { getCacheManager } from "./cache.js";
 import { AdminEventListener } from "./events/adminEventListener.js";
+import EventIndexer from "./events/EventIndexer.js";
 import { getConfiguredContractId } from "./stellar.js";
+import { startRecoveryJob, stopRecoveryJob } from "./jobs/secondary-royalty-recovery.js";
+import {
+  startContractStateConsistencyJob,
+  stopContractStateConsistencyJob,
+} from "./jobs/contract-state-consistency.js";
+import { verifySignedWriteRequest } from "./request-signature.js";
+import eventsRouter from "./routes/events.js";
+import { batchRouter } from "./routes/batch-distribute.js";
 
 // Initialize database on startup
 initializeDatabase();
@@ -46,14 +58,27 @@ const app = express();
 // #396: Correlation ID — must be first so every subsequent middleware has req.correlationId
 app.use(correlationMiddleware);
 
+// #425: Transaction ID Tracking middleware
+app.use(transactionTrackingMiddleware);
+
 // #396: Request / response logging with correlation ID and timing
+import { startSpan } from "./tracing.js";
+
 app.use((req, res, next) => {
   const start = Date.now();
   const requestBytes = parseInt(req.headers["content-length"] ?? "0", 10) || 0;
+  
+  // Start OpenTelemetry-style trace
+  const span = startSpan(`${req.method} ${req.originalUrl}`, req.correlationId);
+  span.setAttribute("http.method", req.method);
+  span.setAttribute("http.url", req.originalUrl);
 
   res.on("finish", () => {
     const durationMs = Date.now() - start;
     const responseBytes = parseInt(res.getHeader("content-length") ?? "0", 10) || 0;
+
+    span.setAttribute("http.status_code", res.statusCode);
+    span.end();
 
     logger.info("HTTP request completed", {
       correlationId: req.correlationId,
@@ -78,8 +103,22 @@ app.use((req, res, next) => {
 // normalizing into a different protected path.
 app.use(createLegacyApiRedirectMiddleware({ logger }));
 
-// Security headers
-app.use(helmet());
+// Security headers. #499: set an explicit Content-Security-Policy so a reflected
+// or stored payload cannot execute inline scripts even if it reaches the DOM.
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+  })
+);
 
 const corsPreflightMaxAge = parseInt(process.env.CORS_PREFLIGHT_MAX_AGE ?? "86400", 10);
 
@@ -102,8 +141,21 @@ app.use(
       "X-Nonce",
       "X-Signature",
       "X-API-Key",
+      "X-Transaction-ID",
     ],
-    exposedHeaders: ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+    exposedHeaders: [
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset",
+      "X-Transaction-ID",
+    ],
+    exposedHeaders: [
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset",
+      "X-Export-Signature",
+      "X-Export-Public-Key",
+    ],
     maxAge: Number.isNaN(corsPreflightMaxAge) ? 86400 : corsPreflightMaxAge,
   })
 );
@@ -186,23 +238,32 @@ app.use((req, res, next) => {
 app.use("/api/v1/initialize", writeLimiter);
 app.use("/api/v1/distribute", writeLimiter);
 app.use("/api/v1/secondary-royalty", writeLimiter);
-app.use("/api/v1/webhooks", writeLimiter);
+app.use("/api/v1/transaction", writeLimiter);
+app.use("/api/v1/audit", writeLimiter);
+app.use("/api/v1/batch-distribute", writeLimiter);
 
-// Per-endpoint rate limits for read-heavy analytics/history routes (#394)
-app.use("/api/v1/history", readAnalyticsLimiter);
-app.use("/api/v1/audit", readAnalyticsLimiter);
-app.use("/api/v1/analytics", readAnalyticsLimiter);
+// Require Ed25519 request signatures for mutating client API operations.
+app.use("/api/v1/initialize", verifySignedWriteRequest);
+app.use("/api/v1/distribute", verifySignedWriteRequest);
+app.use("/api/v1/secondary-royalty", verifySignedWriteRequest);
+app.use("/api/v1/transaction", verifySignedWriteRequest);
+app.use("/api/v1/audit", verifySignedWriteRequest);
+app.use("/api/v1/batch-distribute", verifySignedWriteRequest);
 
 app.use("/api/v1/initialize", initializeRouter);
 app.use("/api/v1/distribute", distributeRouter);
+app.use("/api/v1/batch-distribute", batchRouter);
 app.use("/api/v1/collaborators", collaboratorsRouter);
 app.use("/api/v1/secondary-royalty", secondaryRoyaltyRouter);
 app.use("/api/v1/simulate", simulateRouter);
 app.use("/api/v1", historyRouter);
 app.use("/api/v1", webhooksRouter);
 app.use("/api/v1", analyticsRouter);
+app.use("/api/v1", eventsRouter);
 app.use("/api/v1/contract", contractRouter);
 app.use("/api/v1/health", healthRouter);
+app.use("/api/v1/traces", tracesRouter);
+app.use("/api/v1/admin", auditExportRouter);
 app.use("/metrics", metricsRouter);
 app.use("/api/v1/metrics", metricsRouter);
 
@@ -253,6 +314,7 @@ server.headersTimeout = parseInt(process.env.HEADERS_TIMEOUT_MS ?? "40000");
 // #399: Initialize cache manager and admin event listener
 const contractId = getConfiguredContractId();
 let adminEventListener = null;
+let eventIndexer = null;
 
 if (contractId) {
   try {
@@ -262,18 +324,49 @@ if (contractId) {
     // Start event listener for admin transfer events
     const { getSorobanRpcClient } = await import("./stellar.js");
     const sorobanRpc = getSorobanRpcClient();
+    
+    // Start event indexer for all contract events
+    eventIndexer = new EventIndexer(sorobanRpc, contractId);
+    eventIndexer.start();
+    logger.info("[Startup] Event indexer started", { contractId });
+
+    // Start admin event listener for admin transfer events
     adminEventListener = new AdminEventListener(sorobanRpc, contractId);
     adminEventListener.start();
     logger.info("[Startup] Admin event listener started", { contractId });
   } catch (err) {
-    logger.error("[Startup] Failed to initialize cache/event listener", {
+    logger.error("[Startup] Failed to initialize cache/event indexer/listeners", {
       error: err.message,
       contractId,
     });
   }
 }
 
-// Graceful shutdown — include event listener and cache cleanup
+// Start secondary royalty recovery job
+if (process.env.NODE_ENV !== "test" && !process.env.DISABLE_RECOVERY_JOB) {
+  try {
+    startRecoveryJob();
+    logger.info("[Startup] Secondary royalty recovery job started");
+  } catch (err) {
+    logger.error("[Startup] Failed to start recovery job", {
+      error: err.message,
+    });
+  }
+}
+
+// Start hourly contract state consistency verification (#510)
+if (process.env.NODE_ENV !== "test" && !process.env.DISABLE_CONSISTENCY_JOB) {
+  try {
+    startContractStateConsistencyJob();
+    logger.info("[Startup] Contract state consistency job started");
+  } catch (err) {
+    logger.error("[Startup] Failed to start contract state consistency job", {
+      error: err.message,
+    });
+  }
+}
+
+// Graceful shutdown — include event indexer, admin event listener, cache cleanup, and recovery job
 const originalShutdown = createGracefulShutdownHandler({
   server,
   closeDatabase,
@@ -282,9 +375,14 @@ const originalShutdown = createGracefulShutdownHandler({
 
 const handleShutdown = (signal) => {
   logger.info(`[Shutdown] ${signal} received, cleaning up...`);
+  if (eventIndexer) {
+    eventIndexer.stop();
+  }
   if (adminEventListener) {
     adminEventListener.stop();
   }
+  stopRecoveryJob();
+  stopContractStateConsistencyJob();
   const cache = getCacheManager();
   cache.disconnect().catch(() => {});
   originalShutdown(signal);

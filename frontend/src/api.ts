@@ -1,63 +1,34 @@
 // Thin client that talks to the Express backend
 
-import { signWriteRequest } from "./lib/request-signing";
+import { extractContractError } from "./lib/contract-errors";
+import { createSignedRequestHeaders } from "./request-signing";
+export { setRequestSigningSecret } from "./request-signing";
 
 const BASE = "/api/v1";
 export const SESSION_EXPIRED_EVENT = "srs:session-expired";
-const SESSION_EXPIRED_MESSAGE =
-  "Your session has expired. Please connect your wallet again.";
 
-let sessionExpiryNotified = false;
-
-function notifySessionExpired() {
-  if (sessionExpiryNotified || typeof window === "undefined") return;
-  sessionExpiryNotified = true;
-  window.dispatchEvent(
-    new CustomEvent(SESSION_EXPIRED_EVENT, {
-      detail: { message: SESSION_EXPIRED_MESSAGE },
-    }),
-  );
-}
-
-async function readJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function getErrorMessage(data: unknown, status: number) {
-  if (
-    data &&
-    typeof data === "object" &&
-    "error" in data &&
-    typeof data.error === "string"
+// #279: surface a structured `code + message + details` shape from
+// the backend's error response instead of just `data.error`. The
+// caller's `catch (e)` block can call `extractContractError(e)` to
+// pull the same fields back out and the toast surfaces the real
+// failure reason (`Caller is not the contract admin (code 2)`)
+// rather than a generic "transaction failed".
+export class BackendApiError extends Error {
+  code: string | number | null;
+  details?: string;
+  status: number;
+  constructor(
+    status: number,
+    code: string | number | null,
+    message: string,
+    details?: string,
   ) {
-    return data.error;
+    super(message);
+    this.name = "BackendApiError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
   }
-
-  return `Request failed (${status})`;
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
-  const data = await readJson(res);
-
-  if (res.status === 401) {
-    notifySessionExpired();
-    throw new Error(SESSION_EXPIRED_MESSAGE);
-  }
-
-  if (res.ok) {
-    sessionExpiryNotified = false;
-    return data as T;
-  }
-
-  throw new Error(getErrorMessage(data, res.status));
 }
 
 async function post<T>(
@@ -66,20 +37,18 @@ async function post<T>(
   walletAddress?: string,
   extraHeaders?: Record<string, string>,
 ): Promise<T> {
+  const requestPath = `${BASE}${path}`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-  if (walletAddress && typeof body === "object" && body !== null) {
-    try {
-      const signingHeaders = await signWriteRequest({
+  if (walletAddress) {
+    Object.assign(
+      headers,
+      createSignedRequestHeaders({
         method: "POST",
-        path: `${BASE}${path}`,
+        path: requestPath,
         body,
-        walletAddress,
-      });
-      Object.assign(headers, signingHeaders);
-    } catch {
-      // Signing is optional when REQUEST_SIGNING_REQUIRED=false on the server.
-    }
+      }),
+    );
   }
 
   if (extraHeaders) {
@@ -103,6 +72,23 @@ export function generateIdempotencyKey(): string {
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   return request<T>(path, signal ? { signal } : undefined);
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, init);
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    const extracted = extractContractError(data);
+    throw new BackendApiError(
+      res.status,
+      extracted.code,
+      extracted.message || res.statusText,
+      extracted.details,
+    );
+  }
+
+  return data as T;
 }
 
 export interface TransactionRecord {
@@ -136,6 +122,14 @@ export interface AuditLogEntry {
   timestamp: string;
 }
 
+export interface CollaboratorSuggestion {
+  address: string;
+  label: string;
+  contractId: string | null;
+  lastSeen: string | null;
+  sources: string[];
+}
+
 export interface SecondarySale {
   id: number;
   nftId: string;
@@ -159,6 +153,14 @@ export interface RoyaltyStats {
   } | null;
 }
 
+// #504: contract pause state for the distribution UI banner.
+export interface PauseState {
+  paused: boolean;
+  pauseTimestamp: number;
+  pauseSource: string | null;
+  remainingSeconds: number;
+}
+
 export type ContractStateCacheStatus = "cached" | "live" | "error";
 
 export interface ContractState {
@@ -173,6 +175,7 @@ export interface ContractState {
   cacheStatus: Exclude<ContractStateCacheStatus, "error">;
   cacheTtlMs: number;
   fetchedAt: string;
+  isDegraded?: boolean;
 }
 
 export const api = {
@@ -226,6 +229,7 @@ export const api = {
       contractId: string;
       walletAddress: string;
       tokenId: string;
+      amount?: number;
     },
     idempotencyKey?: string,
   ) =>
@@ -244,6 +248,11 @@ export const api = {
   getCollaborators: (contractId: string) =>
     get<{ address: string; basisPoints: number }[]>(
       `/collaborators/${contractId}`,
+    ),
+
+  lookupCollaborators: (query = "", limit = 10) =>
+    get<{ suggestions: CollaboratorSuggestion[] }>(
+      `/collaborators/lookup?q=${encodeURIComponent(query)}&limit=${limit}`,
     ),
 
   // Transaction History & Audit Log APIs
@@ -390,6 +399,10 @@ export const api = {
       `/contract/version/${contractId}`,
     ),
 
+  // #504: Fetch the contract's pause state so the UI can warn and block.
+  getPauseState: (contractId: string) =>
+    get<PauseState>(`/contract/pause/${contractId}`),
+
   getContractState: (
     contractId: string,
     options: { bypassCache?: boolean } = {},
@@ -434,4 +447,11 @@ export const api = {
     }>(
       `/analytics/${contractId}${dateRange ? `?start=${dateRange.start}&end=${dateRange.end}` : ""}`,
     ),
+
+  // NEW: Fetch overall system health
+  getHealth: () => get<{ ok: boolean; horizon: { connected: boolean } }>("/health"),
+
+  // NEW: Fetch traces for a correlation ID
+  getTraces: (correlationId: string) =>
+    get<{ success: boolean; traces: Array<any> }>(`/traces/${correlationId}`),
 };

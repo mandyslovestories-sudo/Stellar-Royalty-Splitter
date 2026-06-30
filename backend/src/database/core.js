@@ -3,11 +3,13 @@ import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import logger from "../logger.js";
+import { instrumentDatabase } from "../query-profiler.js";
+import { assertValidContractId } from "../contract-id.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.DATABASE_PATH ?? path.join(__dirname, "..", "..", "audit.db");
 
-export const db = new Database(dbPath);
+export const db = instrumentDatabase(new Database(dbPath));
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL"); // safe with WAL, much faster
 db.pragma("cache_size = -64000"); // 64MB page cache
@@ -53,10 +55,198 @@ export function initializeDatabase() {
     );
   `);
 
+  // Ensure base tables exist before running additive migrations. Some older
+  // migration entries add indexes/columns to these tables.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      txHash TEXT UNIQUE,
+      contractId TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('initialize', 'distribute', 'secondary_royalty', 'secondary_distribute')),
+      initiatorAddress TEXT NOT NULL,
+      requestedAmount TEXT,
+      tokenId TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      blockTime DATETIME,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'confirmed', 'failed')),
+      errorMessage TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS distribution_payouts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transactionId INTEGER NOT NULL,
+      contractId TEXT NOT NULL DEFAULT '',
+      collaboratorAddress TEXT NOT NULL,
+      amountReceived TEXT NOT NULL,
+      FOREIGN KEY(transactionId) REFERENCES transactions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS secondary_sales (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contractId TEXT NOT NULL,
+      nftId TEXT NOT NULL,
+      previousOwner TEXT NOT NULL,
+      newOwner TEXT NOT NULL,
+      salePrice TEXT NOT NULL,
+      saleToken TEXT NOT NULL,
+      royaltyAmount TEXT NOT NULL,
+      royaltyRate INTEGER NOT NULL,
+      distributed INTEGER NOT NULL DEFAULT 0,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      transactionHash TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS secondary_royalty_distributions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transactionId INTEGER NOT NULL,
+      contractId TEXT NOT NULL,
+      totalRoyaltiesDistributed TEXT NOT NULL,
+      numberOfSales INTEGER NOT NULL,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(transactionId) REFERENCES transactions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contractId TEXT NOT NULL,
+      action TEXT NOT NULL,
+      user TEXT,
+      details TEXT,
+      entry_hash TEXT NOT NULL,
+      prev_hash TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contractId TEXT NOT NULL,
+      url TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(contractId, url)
+    );
+
+      CREATE TABLE IF NOT EXISTS webhook_dead_letters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        webhookId INTEGER,
+        contractId TEXT NOT NULL,
+        url TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        errorMessage TEXT,
+        retryCount INTEGER NOT NULL DEFAULT 0,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        lastAttemptAt DATETIME,
+        FOREIGN KEY(webhookId) REFERENCES webhooks(id) ON DELETE SET NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS indexed_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT UNIQUE,
+        ledger_sequence INTEGER,
+        transaction_hash TEXT,
+        event_index INTEGER,
+        timestamp DATETIME,
+        contract_id TEXT NOT NULL,
+        event_type TEXT,
+        event_data TEXT,
+        raw_event TEXT,
+        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_indexed_events_contractId ON indexed_events(contract_id);
+      CREATE INDEX IF NOT EXISTS idx_indexed_events_ledger_sequence ON indexed_events(ledger_sequence);
+      CREATE INDEX IF NOT EXISTS idx_indexed_events_event_type ON indexed_events(event_type);
+      CREATE INDEX IF NOT EXISTS idx_indexed_events_timestamp ON indexed_events(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_indexed_events_transaction_hash ON indexed_events(transaction_hash);
+  `);
+
   const migrations = [
     {
       version: 1,
       sql: `/* initial schema — already applied via CREATE TABLE IF NOT EXISTS */`,
+    },
+    {
+      // Issue #492: RBAC roles assignment database table
+      version: 10,
+      sql: `
+        CREATE TABLE IF NOT EXISTS user_roles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contractId TEXT,
+          walletAddress TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('viewer', 'operator', 'admin')),
+          assignedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          assignedBy TEXT,
+          UNIQUE(contractId, walletAddress)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_roles_walletAddress ON user_roles(walletAddress);
+
+        -- Retry queue for failed secondary royalty distributions
+        CREATE TABLE IF NOT EXISTS secondary_royalty_retry_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contractId TEXT NOT NULL,
+          walletAddress TEXT NOT NULL,
+          tokenId TEXT NOT NULL,
+          collaborators TEXT,
+          totalRoyalties TEXT NOT NULL,
+          numberOfSales INTEGER NOT NULL,
+          pendingSaleIds TEXT NOT NULL,
+          totalDustAllocated TEXT NOT NULL DEFAULT '0',
+          dustAuditData TEXT,
+          errorMessage TEXT,
+          retryCount INTEGER NOT NULL DEFAULT 0,
+          nextRetryAt DATETIME NOT NULL,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          lastAttemptAt DATETIME
+        );
+        CREATE INDEX IF NOT EXISTS idx_retry_queue_nextRetryAt ON secondary_royalty_retry_queue(nextRetryAt);
+        CREATE INDEX IF NOT EXISTS idx_retry_queue_contractId ON secondary_royalty_retry_queue(contractId);
+
+        -- Dead-letter queue for permanently failed secondary royalty distributions
+        CREATE TABLE IF NOT EXISTS secondary_royalty_dlq (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contractId TEXT NOT NULL,
+          walletAddress TEXT NOT NULL,
+          tokenId TEXT NOT NULL,
+          collaborators TEXT,
+          totalRoyalties TEXT NOT NULL,
+          numberOfSales INTEGER NOT NULL,
+          pendingSaleIds TEXT NOT NULL,
+          totalDustAllocated TEXT NOT NULL DEFAULT '0',
+          dustAuditData TEXT,
+          errorMessage TEXT NOT NULL,
+          failureReason TEXT NOT NULL,
+          retryCount INTEGER NOT NULL DEFAULT 0,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          failedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_dlq_contractId ON secondary_royalty_dlq(contractId);
+        CREATE INDEX IF NOT EXISTS idx_dlq_createdAt ON secondary_royalty_dlq(createdAt);
+      `,
+    },
+    {
+      // Issue #462: composite index for single-query royalty statistics
+      version: 8,
+      sql: `
+        CREATE INDEX IF NOT EXISTS idx_secondary_distributions_contractId_timestamp
+          ON secondary_royalty_distributions(contractId, timestamp);
+      `,
+    },
+    {
+      // Issue #425: request tracking table for transaction ID tracking
+      version: 9,
+      sql: `
+        CREATE TABLE IF NOT EXISTS request_tracking (
+          transactionId TEXT PRIMARY KEY,
+          correlationId TEXT NOT NULL,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          requestBody TEXT,
+          responseStatus INTEGER,
+          responseBody TEXT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_request_tracking_correlationId ON request_tracking(correlationId);
+        CREATE INDEX IF NOT EXISTS idx_request_tracking_timestamp ON request_tracking(timestamp);
+      `,
     },
     {
       // Issue #427: track dust allocated per secondary-royalty distribution round
@@ -110,17 +300,9 @@ export function initializeDatabase() {
     {
       version: 4,
       sql: `
-        -- Issue #395: Add hash chain to audit_log for integrity verification
-        BEGIN;
-        
-        -- Add hash columns if they don't exist
-        ALTER TABLE audit_log ADD COLUMN entry_hash TEXT;
-        ALTER TABLE audit_log ADD COLUMN prev_hash TEXT;
-        
-        -- Create index on entry_hash for faster verification
+        -- Issue #395: Add hash-chain index to audit_log for integrity verification.
+        -- Current base schemas already include entry_hash and prev_hash.
         CREATE INDEX IF NOT EXISTS idx_audit_entry_hash ON audit_log(entry_hash);
-        
-        COMMIT;
       `,
     },
     {
@@ -182,17 +364,63 @@ export function initializeDatabase() {
         PRAGMA foreign_keys = ON;
       `,
     },
+    {
+      // Issue #461: composite index on transactions for pagination queries
+      // Accelerates getTransactionHistory() which filters by contractId and orders by timestamp DESC.
+      version: 10,
+      sql: `
+        CREATE INDEX IF NOT EXISTS idx_transactions_contractId_timestamp_desc
+          ON transactions(contractId, timestamp DESC);
+      `,
+    },
+    {
+      // Issue #521: batch processing for large distributions
+      version: 11,
+      sql: `
+        CREATE TABLE IF NOT EXISTS batch_jobs (
+          id TEXT PRIMARY KEY,
+          contractId TEXT NOT NULL,
+          walletAddress TEXT NOT NULL,
+          tokenId TEXT NOT NULL,
+          totalCollaborators INTEGER NOT NULL,
+          totalChunks INTEGER NOT NULL,
+          completedChunks INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued', 'processing', 'completed', 'failed', 'partial')),
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          completedAt DATETIME
+        );
+        CREATE INDEX IF NOT EXISTS idx_batch_jobs_contractId ON batch_jobs(contractId);
+        CREATE INDEX IF NOT EXISTS idx_batch_jobs_status ON batch_jobs(status);
+
+        CREATE TABLE IF NOT EXISTS batch_job_chunks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batchJobId TEXT NOT NULL,
+          chunkIndex INTEGER NOT NULL,
+          collaborators TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'completed', 'failed')),
+          transactionId INTEGER,
+          errorMessage TEXT,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          startedAt DATETIME,
+          completedAt DATETIME,
+          FOREIGN KEY(batchJobId) REFERENCES batch_jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_batch_job_chunks_batchJobId ON batch_job_chunks(batchJobId);
+        CREATE INDEX IF NOT EXISTS idx_batch_job_chunks_status ON batch_job_chunks(status);
+      `,
+    },
   ];
 
-  const applied = db
+  const applied = new Set(db
     .prepare("SELECT version FROM schema_migrations")
     .all()
-    .map((r) => r.version);
+    .map((r) => r.version));
 
   for (const migration of migrations) {
-    if (!applied.includes(migration.version)) {
+    if (!applied.has(migration.version)) {
       db.exec(migration.sql);
       db.prepare("INSERT INTO schema_migrations (version) VALUES (?)").run(migration.version);
+      applied.add(migration.version);
       logger.info(`Applied migration v${migration.version}`);
     }
   }
@@ -258,14 +486,23 @@ export function initializeDatabase() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_transactions_contractId ON transactions(contractId);
+    CREATE INDEX IF NOT EXISTS idx_transactions_contractId_timestamp_desc ON transactions(contractId, timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_transactions_txHash ON transactions(txHash);
     CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
+    CREATE INDEX IF NOT EXISTS idx_transactions_contract_status_timestamp_type
+      ON transactions(contractId, status, timestamp, type);
     CREATE INDEX IF NOT EXISTS idx_secondary_sales_contractId ON secondary_sales(contractId);
     CREATE INDEX IF NOT EXISTS idx_secondary_sales_nftId ON secondary_sales(nftId);
     CREATE INDEX IF NOT EXISTS idx_secondary_sales_timestamp ON secondary_sales(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_secondary_sales_contract_distributed_timestamp
+      ON secondary_sales(contractId, distributed, timestamp);
     CREATE INDEX IF NOT EXISTS idx_secondary_distributions_contractId ON secondary_royalty_distributions(contractId);
+    CREATE INDEX IF NOT EXISTS idx_secondary_distributions_contract_timestamp
+      ON secondary_royalty_distributions(contractId, timestamp);
     CREATE INDEX IF NOT EXISTS idx_audit_contractId ON audit_log(contractId);
     CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_distribution_payouts_transaction_collaborator
+      ON distribution_payouts(transactionId, collaboratorAddress);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_secondary_sales_dedup ON secondary_sales(contractId, nftId, previousOwner, newOwner, salePrice, saleToken);
   `);
 
@@ -287,10 +524,7 @@ export function initializeDatabase() {
  * Get the current database schema migration version.
  */
 export function getMigrationVersion() {
-  const result = db
-    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-    .get();
-  return result?.version ?? 0;
+  return getCurrentVersion(db);
 }
 
 /**
@@ -316,18 +550,18 @@ export function computeAuditEntryHash(contractId, action, user, details, timesta
  */
 export function verifyAuditLogIntegrity(contractId = null) {
   try {
-    let query = `
+    if (contractId !== null) {
+      assertValidContractId(contractId);
+    }
+
+    const whereClause = contractId ? "WHERE contractId = ?" : "";
+    const query = `
       SELECT id, contractId, action, user, details, entry_hash, prev_hash, timestamp
       FROM audit_log
+      ${whereClause}
+      ORDER BY id ASC
     `;
-    const params = [];
-    
-    if (contractId) {
-      query += ` WHERE contractId = ?`;
-      params.push(contractId);
-    }
-    
-    query += ` ORDER BY id ASC`;
+    const params = contractId ? [contractId] : [];
     
     const entries = db.prepare(query).all(...params);
     

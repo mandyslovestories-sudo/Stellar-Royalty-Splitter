@@ -49,6 +49,12 @@ Operator health check for the backend and Stellar connectivity.
     "deployed": true,
     "initialized": true,
     "status": "initialized"
+  },
+  "queryProfiler": {
+    "enabled": true,
+    "thresholdMs": 100,
+    "totalQueries": 12,
+    "slowQueries": 1
   }
 }
 ```
@@ -61,14 +67,52 @@ Operator health check for the backend and Stellar connectivity.
 | `horizon.connected` | Whether Horizon responded successfully |
 | `horizon.url` | Configured `HORIZON_URL` |
 | `contract.status` | `not_configured`, `deployed`, `initialized`, `unreachable`, or `error` |
+| `queryProfiler` | In-process database query profiling summary |
 
 Configure the default contract with `ROYALTY_CONTRACT_ID` or `CONTRACT_ID`. Responses are cached for `HEALTH_CACHE_TTL_MS` (default 30s).
+
+### `GET /api/v1/health/query-performance`
+
+Returns the in-process query profiler metrics used to diagnose slow SQLite
+statements. Queries at or above `SLOW_QUERY_THRESHOLD_MS` are logged and sampled.
+The default threshold is `100`.
+
+**Response**
+
+```json
+{
+  "enabled": true,
+  "thresholdMs": 100,
+  "totalQueries": 12,
+  "slowQueries": 1,
+  "averageDurationMs": 22.4,
+  "maxDurationMs": 132.1,
+  "operations": {
+    "all": {
+      "count": 5,
+      "slowCount": 1,
+      "averageDurationMs": 44.8,
+      "maxDurationMs": 132.1
+    }
+  },
+  "slowQuerySamples": [
+    {
+      "sql": "SELECT ...",
+      "operation": "all",
+      "durationMs": 132.1,
+      "thresholdMs": 100,
+      "observedAt": "2026-01-01T00:00:00.000Z",
+      "recommendations": ["Run EXPLAIN QUERY PLAN for this statement and consider a targeted composite index."]
+    }
+  ]
+}
+```
 
 Legacy `/api/*` paths redirect to `/api/v1/*`.
 
 ## Request signing (#392)
 
-Write operations (`POST`, `PUT`, `DELETE`) may require Ed25519 request signatures when `REQUEST_SIGNING_REQUIRED=true`.
+Write operations (`POST`, `PUT`, `DELETE`) require Ed25519 request signatures by default. Set `REQUEST_SIGNING_REQUIRED=false` only for local development or controlled compatibility testing.
 
 **Headers:**
 
@@ -101,6 +145,7 @@ Build an unsigned `initialize` transaction XDR.
 All initialize and royalty split payloads pass through request validation middleware before reaching contract processing. The middleware verifies that:
 - All recipient addresses are valid Stellar public keys (`G...`)
 - Revenue allocations sum to exactly `100%` (or `10,000` basis points)
+- Shares/percentages must resolve to integer basis points (no fractional basis points allowed)
 **Body:** `{ contractId, walletAddress, collaborators, shares, nonce? }`
 
 | Field | Type | Description |
@@ -368,7 +413,82 @@ Required environment:
 
 ## Secondary royalty
 
-See route module `src/routes/secondary-royalty.js` for pool, sales, and distribution endpoints.
+### `POST /api/secondary-royalty`
+
+Record a secondary (resale) NFT sale and build an unsigned `record_secondary_royalty` transaction XDR.
+
+**Body:** `{ contractId, walletAddress, nftId, previousOwner, newOwner, salePrice, saleToken, royaltyRate }`
+
+**Response:** `{ xdr, transactionId, royaltyAmount, royaltyRateUsed }`
+
+Returns `409 Conflict` if the sale has already been recorded (SQLite unique constraint).
+
+### `POST /api/secondary-royalty/distribute`
+
+Build an unsigned `distribute_secondary_royalties` transaction XDR and mark pending sales as distributed.
+
+**Body:** `{ contractId, walletAddress, tokenId, collaborators? }`
+
+Optionally pass `collaborators` (array of `{ address, basisPoints }` summing to 10000) to split using the largest-remainder algorithm (#427).
+
+**Response:** `{ xdr, transactionId, numberOfSales, totalRoyalties, dustAllocated, allocations? }`
+
+### `POST /api/secondary-royalty/set-rate`
+
+Build an unsigned `set_royalty_rate` transaction XDR.
+
+**Body:** `{ contractId, walletAddress, royaltyRate }` (`royaltyRate` in basis points, 0–10000)
+
+**Response:** `{ xdr, transactionId }`
+
+### `GET /api/secondary-royalty/rate/:contractId`
+
+Returns the current on-chain royalty rate.
+
+**Response:** `{ contractId, royaltyRate }`
+
+### `GET /api/secondary-royalty/pool/:contractId`
+
+Returns the current secondary royalty pool balance.
+
+**Response:** `{ poolBalance }`
+
+### `GET /api/secondary-royalty/stats/:contractId`
+
+Returns aggregated royalty statistics. Results are cached in-memory for 60 seconds.
+
+**Response:** `{ totalSecondarySales, totalRoyaltiesGenerated, totalVolume, pendingRoyaltyPool, lastDistribution }`
+
+### `GET /api/secondary-royalty/sales/:contractId`
+
+Paginated list of secondary sales with optional date-range and NFT filtering.
+
+**Query parameters:**
+
+| Param | Type | Default | Constraints |
+| ----- | ---- | ------- | ----------- |
+| `limit` | integer | `10` | `1`–`100` |
+| `offset` | integer | `0` | `0`–`1000000` |
+| `nftId` | string | — | Optional NFT identifier filter |
+| `startDate` | ISO 8601 string | — | Optional lower bound on `timestamp` |
+| `endDate` | ISO 8601 string | — | Optional upper bound on `timestamp`; must be ≥ `startDate` |
+
+Invalid `limit` or `offset` values return `400` with validation details. Invalid date strings or `startDate > endDate` also return `400`.
+
+**Response:** `{ sales: [...], total: number }`
+
+### `GET /api/secondary-royalty/distributions/:contractId`
+
+Paginated list of secondary royalty distribution records.
+
+**Query parameters:**
+
+| Param | Type | Default | Constraints |
+| ----- | ---- | ------- | ----------- |
+| `limit` | integer | `10` | `1`–`100` |
+| `offset` | integer | `0` | `0`–`1000000` |
+
+**Response:** `{ distributions: [...], pagination: { limit, offset } }`
 
 ## History & analytics
 

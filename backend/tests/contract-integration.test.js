@@ -33,8 +33,11 @@ await jest.unstable_mockModule("../src/stellar.js", () => ({
   retryBuildTx,
   isContractInitialized,
   addressToScVal:   jest.fn((a) => a),
+  bytesN32HexToScVal: jest.fn((h) => h),
   u32ToScVal:       jest.fn((n) => n),
   vecToScVal:       jest.fn((v) => v),
+  bytesN32HexToScVal: jest.fn((h) => h),
+  getNetworkLabel: jest.fn(() => "Testnet"),
   server:           {},
   networkPassphrase: "Test SDF Network ; September 2015",
 }));
@@ -48,6 +51,7 @@ await jest.unstable_mockModule("../src/database/index.js", () => ({
   recordNonceIfNew: jest.fn(() => true),
   initializeDatabase:  jest.fn(),
   getMigrationVersion: jest.fn(() => 1),
+  lookupCollaborators: jest.fn(() => []),
 }));
 
 // Import the shared test app (mounts all routers) AFTER the mocks are in place.
@@ -170,8 +174,8 @@ describe("Contract integration — initialize → distribute flow", () => {
 
     expect(res.status).toBe(503);
     expect(res.body.error).toMatch(/unavailable/i);
-    // Transaction must NOT be recorded on RPC failure.
-    expect(recordTransaction).not.toHaveBeenCalled();
+    // A pending transaction row is created before Stellar transaction build.
+    expect(recordTransaction).toHaveBeenCalledTimes(1);
   });
 
   // ── Scenario 5: Distribute idempotency ─────────────────────────────────────
