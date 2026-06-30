@@ -3,6 +3,7 @@
  * Signs write requests with the connected wallet via Freighter or SDK Keypair.
  */
 import { Keypair } from "@stellar/stellar-sdk";
+import { Buffer } from "buffer";
 
 const SIGNING_PATH_PREFIX = "/api/v1";
 
@@ -12,6 +13,10 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function base64Encode(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes));
 }
 
 export function buildCanonicalMessage({
@@ -120,11 +125,11 @@ export async function signWriteRequestWithSecret({
     nonce,
     bodyHash,
   });
-  const sig = keypair.sign(Buffer.from(message, "utf8"));
+  const sig = keypair.sign(new TextEncoder().encode(message));
   return {
     "X-Wallet-Address": keypair.publicKey(),
     "X-Timestamp": String(timestamp),
     "X-Nonce": nonce,
-    "X-Signature": sig.toString("base64"),
+    "X-Signature": base64Encode(sig),
   };
 }

@@ -8,7 +8,9 @@ import {
   getRoyaltyRateFromContract,
   server,
 } from "../stellar.js";
+import logger from "../logger.js";
 import {
+  db,
   recordTransaction,
   recordSecondarySale,
   getSecondarySales,
@@ -18,8 +20,13 @@ import {
   addAuditLog,
   applyLargestRemainder,
   commitSecondaryDistributionAtomic,
+  addToRetryQueue,
+  getRetryQueueStats,
+  getDeadLetterQueueStats,
+  getDeadLetterItems,
 } from "../database/index.js";
 import { idempotencyMiddleware } from "../idempotency.js";
+import { assertValidXdr } from "./_shared.js";
 import {
   validate,
   recordSecondarySaleSchema,
@@ -107,26 +114,34 @@ secondaryRoyaltyRouter.post("/", idempotencyMiddleware, validate(recordSecondary
       return sendError(res, 400, "bad_request", "Calculated royalty amount is zero.");
     }
 
-    const transactionId = recordTransaction(contractId, "secondary_royalty", walletAddress, {
-      salePrice: salePrice.toString(),
-      nftId,
-      saleToken,
-      royaltyRate: onChainRate,
-    });
-
+    let transactionId;
     try {
-      recordSecondarySale(
-        contractId,
-        nftId,
-        previousOwner,
-        newOwner,
-        salePrice,
-        saleToken,
-        royaltyAmount,
-        onChainRate
-      );
+      const insertRecord = db.transaction(() => {
+        transactionId = recordTransaction(contractId, "secondary_royalty", walletAddress, {
+          salePrice: salePrice.toString(),
+          nftId,
+          saleToken,
+          royaltyRate: onChainRate,
+        });
+        recordSecondarySale(
+          contractId,
+          nftId,
+          previousOwner,
+          newOwner,
+          salePrice,
+          saleToken,
+          royaltyAmount,
+          onChainRate
+        );
+      });
+      insertRecord();
     } catch (err) {
-      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      if (err.code && err.code.startsWith("SQLITE_CONSTRAINT")) {
+        logger.warn("SQLite constraint violation recording secondary sale", {
+          code: err.code,
+          contractId,
+          nftId,
+        });
         return sendError(res, 409, "conflict", "This sale has already been recorded.");
       }
       throw err;
@@ -135,6 +150,9 @@ secondaryRoyaltyRouter.post("/", idempotencyMiddleware, validate(recordSecondary
     const txXdr = await buildTx(walletAddress, contractId, "record_secondary_royalty", [
       i128ToScVal(salePrice),
     ]);
+
+    // Reject invalid XDR before it ever reaches the client (#XDR validation).
+    assertValidXdr(txXdr);
 
     addAuditLog(contractId, "secondary_sale_recorded", walletAddress, {
       transactionId,
@@ -187,6 +205,9 @@ secondaryRoyaltyRouter.post("/set-rate", validate(setRoyaltyRateSchema), async (
     const txXdr = await buildTx(walletAddress, contractId, "set_royalty_rate", [
       u32ToScVal(royaltyRate),
     ]);
+
+    // Reject invalid XDR before it ever reaches the client (#XDR validation).
+    assertValidXdr(txXdr);
 
     addAuditLog(contractId, "royalty_rate_set", walletAddress, {
       transactionId,
@@ -277,9 +298,45 @@ secondaryRoyaltyRouter.post(
 
       // Build the Stellar XDR *before* any DB writes so that a Stellar failure
       // never leaves sales in an inconsistent state (#471).
-      const txXdr = await buildTx(walletAddress, contractId, "distribute_secondary_royalties", [
-        addressToScVal(tokenId),
-      ]);
+      let txXdr;
+      try {
+        txXdr = await buildTx(walletAddress, contractId, "distribute_secondary_royalties", [
+          addressToScVal(tokenId),
+        ]);
+      } catch (buildError) {
+        // Token validation or contract call failed - add to retry queue
+        const errorMessage = buildError.message || String(buildError);
+        addToRetryQueue({
+          contractId,
+          walletAddress,
+          tokenId,
+          collaborators,
+          totalRoyalties,
+          numberOfSales: pendingSales.length,
+          pendingSaleIds: pendingSales.map((s) => s.id),
+          totalDustAllocated,
+          dustAuditData,
+          errorMessage,
+        });
+        
+        logger.error("Secondary royalty distribution failed, added to retry queue", {
+          contractId,
+          tokenId,
+          error: errorMessage,
+        });
+
+        return sendError(
+          res,
+          503,
+          "distribution_failed_retry_queued",
+          `Distribution failed and queued for retry: ${errorMessage}`
+        );
+      }
+
+      // Reject invalid XDR before committing any DB state or returning it to
+      // the client. An invalid envelope is a deterministic failure, so it is
+      // surfaced as an error rather than queued for retry.
+      assertValidXdr(txXdr);
 
       // All DB writes are atomic: if any step fails, the transaction rolls back
       // and pending sales remain undistributed (#471).
@@ -402,6 +459,56 @@ secondaryRoyaltyRouter.get(
       );
 
       res.json({ distributions, pagination });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * GET /api/secondary-royalty/retry-stats
+ * Returns statistics about the retry queue
+ */
+secondaryRoyaltyRouter.get("/retry-stats", (req, res, next) => {
+  try {
+    const stats = getRetryQueueStats();
+    res.json(stats);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/secondary-royalty/dlq-stats
+ * Returns statistics about the dead-letter queue
+ */
+secondaryRoyaltyRouter.get("/dlq-stats", (req, res, next) => {
+  try {
+    const stats = getDeadLetterQueueStats();
+    res.json(stats);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/secondary-royalty/dlq/:contractId
+ * Query params: limit, offset
+ * Returns paginated list of dead-letter queue items for a contract
+ */
+secondaryRoyaltyRouter.get(
+  "/dlq/:contractId",
+  validateContractIdMiddleware,
+  (req, res, next) => {
+    try {
+      const { contractId } = req.params;
+      const pagination = parsePagination(req.query, res);
+      if (!pagination) return;
+      const { limit, offset } = pagination;
+
+      const dlqItems = getDeadLetterItems(contractId, limit, offset);
+
+      res.json({ items: dlqItems, pagination });
     } catch (err) {
       next(err);
     }
