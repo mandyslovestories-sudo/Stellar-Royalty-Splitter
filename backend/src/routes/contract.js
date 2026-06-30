@@ -61,7 +61,38 @@ function decodeShareMap(scVal) {
   }));
 }
 
+// --- Circuit Breaker & Exponential Backoff ---
+const MAX_FAILURES = 3;
+const RESET_TIMEOUT_MS = 10_000;
+let circuitState = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+let failureCount = 0;
+let nextAttemptMs = 0;
+
+function reportSuccess() {
+  circuitState = 'CLOSED';
+  failureCount = 0;
+}
+
+function reportFailure() {
+  failureCount++;
+  if (failureCount >= MAX_FAILURES) {
+    circuitState = 'OPEN';
+    nextAttemptMs = Date.now() + RESET_TIMEOUT_MS;
+  }
+}
+
 async function simulateContractRead(contractId, method, args = []) {
+  if (circuitState === 'OPEN') {
+    if (Date.now() > nextAttemptMs) {
+      circuitState = 'HALF_OPEN';
+    } else {
+      const err = new Error("RPC Circuit Breaker Open");
+      err.isCircuitBreaker = true;
+      err.status = 503;
+      throw err;
+    }
+  }
+
   const contract = new Contract(contractId);
   const dummyAccount = new Account(
     "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
@@ -75,14 +106,31 @@ async function simulateContractRead(contractId, method, args = []) {
     .setTimeout(30)
     .build();
 
-  const sim = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(sim)) {
-    const error = new Error(sim.error ?? `${method} simulation failed`);
-    error.status = 400;
-    throw error;
+  let attempt = 0;
+  const maxAttempts = 3;
+  while (attempt < maxAttempts) {
+    try {
+      const sim = await server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        reportSuccess();
+        const error = new Error(sim.error ?? `${method} simulation failed`);
+        error.status = 400;
+        throw error;
+      }
+      reportSuccess();
+      return sim.result?.retval ?? null;
+    } catch (err) {
+      if (err.status === 400) throw err;
+      
+      attempt++;
+      if (attempt >= maxAttempts) {
+        reportFailure();
+        err.status = 503;
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 100));
+    }
   }
-
-  return sim.result?.retval ?? null;
 }
 
 async function readContractState(contractId, tokenId) {
@@ -170,14 +218,26 @@ contractRouter.get("/state", async (req, res, next) => {
       return res.json(withCacheMetadata(cached.state, "cached", cached.fetchedAt));
     }
 
-    recordCacheMiss("contract_state");
-    const state = await readContractState(contractId, tokenId);
-    contractStateCache.set(cacheKey, { state, fetchedAt: now });
-    res.json(withCacheMetadata(state, "live", now));
-  } catch (err) {
-    if (err.status) {
-      return sendError(res, err.status, undefined, err.message);
+    try {
+      recordCacheMiss("contract_state");
+      const state = await readContractState(contractId, tokenId);
+      contractStateCache.set(cacheKey, { state, fetchedAt: now });
+      res.json(withCacheMetadata(state, "live", now));
+    } catch (err) {
+      if (err.status === 503 || err.isCircuitBreaker) {
+        if (cached) {
+          return res.json({
+            ...withCacheMetadata(cached.state, "cached", cached.fetchedAt),
+            isDegraded: true
+          });
+        }
+      }
+      if (err.status) {
+        return sendError(res, err.status, undefined, err.message);
+      }
+      next(err);
     }
+  } catch (err) {
     next(err);
   }
 });
@@ -200,12 +260,116 @@ contractRouter.get("/info", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /api/v1/contract/verify?contractId=...
+ * Manually verifies DB-derived contract state against live on-chain state.
+ */
+contractRouter.get("/verify", async (req, res, next) => {
+  try {
+    const contractId = firstQueryValue(req.query.contractId) ?? getConfiguredContractId();
+    if (!contractId) {
+      return sendError(
+        res,
+        400,
+        "bad_request",
+        "contractId query param required when no default contract is configured",
+      );
+    }
+    if (!validateContractId(contractId, res)) return;
+
+    const { verifyContractStateConsistency } = await import(
+      "../contract-state-consistency.js"
+    );
+    const result = await verifyContractStateConsistency(contractId, {
+      audit: req.query.audit !== "false",
+    });
+    res.status(result.consistent ? 200 : 409).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/v1/contract/verify
+ * Body: { contractIds?: string[], audit?: boolean }
+ * Manual batch consistency verification endpoint.
+ */
+contractRouter.post("/verify", async (req, res, next) => {
+  try {
+    const contractIds = Array.isArray(req.body?.contractIds)
+      ? req.body.contractIds
+      : [req.body?.contractId ?? getConfiguredContractId()].filter(Boolean);
+
+    if (contractIds.length === 0) {
+      return sendError(
+        res,
+        400,
+        "bad_request",
+        "contractId or contractIds required when no default contract is configured",
+      );
+    }
+
+    for (const contractId of contractIds) {
+      if (!validateContractId(contractId, res)) return;
+    }
+
+    const { verifyAllContractStateConsistency } = await import(
+      "../contract-state-consistency.js"
+    );
+    const result = await verifyAllContractStateConsistency(contractIds, {
+      audit: req.body?.audit !== false,
+    });
+    res.status(result.inconsistentCount === 0 ? 200 : 409).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 contractRouter.get("/status/:contractId", validateContractIdMiddleware, async (req, res, next) => {
   try {
     const { contractId } = req.params;
     const initialized = await isContractInitialized(contractId);
     res.json({ initialized });
   } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/contract/pause/:contractId
+ * #504: Returns the contract's pause state so the UI can warn users (and disable
+ * distribution) before they sign a transaction that would panic on-chain.
+ *
+ * Response: {
+ *   paused: boolean,
+ *   pauseTimestamp: number,   // unix seconds the pause began (0 if not paused)
+ *   pauseSource: string|null, // address that initiated the pause
+ *   remainingSeconds: number  // seconds until an emergency pause auto-expires
+ * }
+ */
+contractRouter.get("/pause/:contractId", validateContractIdMiddleware, async (req, res, next) => {
+  try {
+    const { contractId } = req.params;
+    const [pausedVal, infoVal] = await Promise.all([
+      simulateContractRead(contractId, "is_paused"),
+      simulateContractRead(contractId, "get_pause_info"),
+    ]);
+
+    const paused = pausedVal ? Boolean(StellarSdk.scValToNative(pausedVal)) : false;
+    const [timestamp = 0n, source = null, remaining = 0n] = infoVal
+      ? StellarSdk.scValToNative(infoVal)
+      : [];
+
+    res.json({
+      paused,
+      pauseTimestamp: Number(timestamp),
+      pauseSource: source ? String(source) : null,
+      remainingSeconds: Number(remaining),
+    });
+  } catch (err) {
+    if (err.status) {
+      return sendError(res, err.status, undefined, err.message);
+    }
     next(err);
   }
 });

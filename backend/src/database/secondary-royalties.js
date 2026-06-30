@@ -6,6 +6,8 @@
 import { db, countWrite } from "./core.js";
 import { addAuditLog } from "./audit.js";
 import { recordTransaction } from "./transactions.js";
+import logger from "../logger.js";
+import { assertValidContractId } from "../contract-id.js";
 
 // ---------------------------------------------------------------------------
 // Largest-remainder rounding algorithm (#427)
@@ -87,6 +89,7 @@ export function recordSecondarySale(
   royaltyRate,
   transactionHash = null
 ) {
+  assertValidContractId(contractId);
   const stmt = db.prepare(`
     INSERT INTO secondary_sales 
     (contractId, nftId, previousOwner, newOwner, salePrice, saleToken, royaltyAmount, royaltyRate, transactionHash)
@@ -122,8 +125,31 @@ export function getSecondarySales(
   startDate = null,
   endDate = null
 ) {
-  let query = `
-    SELECT 
+  assertValidContractId(contractId);
+  const conditions = ["contractId = ?"];
+  const params = [contractId];
+
+  if (nftId) {
+    conditions.push("nftId = ?");
+    params.push(nftId);
+  }
+
+  if (undistributedOnly) {
+    conditions.push("distributed = 0");
+  }
+
+  if (startDate) {
+    conditions.push("timestamp >= ?");
+    params.push(startDate);
+  }
+
+  if (endDate) {
+    conditions.push("timestamp <= ?");
+    params.push(endDate);
+  }
+
+  const query = `
+    SELECT
       id,
       nftId,
       previousOwner,
@@ -136,30 +162,9 @@ export function getSecondarySales(
       timestamp,
       transactionHash
     FROM secondary_sales
-    WHERE contractId = ?
+    WHERE ${conditions.join(" AND ")}
+    ORDER BY timestamp DESC LIMIT ? OFFSET ?
   `;
-  const params = [contractId];
-
-  if (nftId) {
-    query += ` AND nftId = ?`;
-    params.push(nftId);
-  }
-
-  if (undistributedOnly) {
-    query += ` AND distributed = 0`;
-  }
-
-  if (startDate) {
-    query += ` AND timestamp >= ?`;
-    params.push(startDate);
-  }
-
-  if (endDate) {
-    query += ` AND timestamp <= ?`;
-    params.push(endDate);
-  }
-
-  query += ` ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
   params.push(limit, offset);
 
   return db.prepare(query).all(...params);
@@ -170,24 +175,26 @@ export function getSecondarySales(
  * Supports optional date range filtering with startDate and endDate.
  */
 export function countSecondarySales(contractId, nftId = null, startDate = null, endDate = null) {
-  let query = `SELECT COUNT(*) as total FROM secondary_sales WHERE contractId = ?`;
+  assertValidContractId(contractId);
+  const conditions = ["contractId = ?"];
   const params = [contractId];
 
   if (nftId) {
-    query += ` AND nftId = ?`;
+    conditions.push("nftId = ?");
     params.push(nftId);
   }
 
   if (startDate) {
-    query += ` AND timestamp >= ?`;
+    conditions.push("timestamp >= ?");
     params.push(startDate);
   }
 
   if (endDate) {
-    query += ` AND timestamp <= ?`;
+    conditions.push("timestamp <= ?");
     params.push(endDate);
   }
 
+  const query = `SELECT COUNT(*) as total FROM secondary_sales WHERE ${conditions.join(" AND ")}`;
   return db.prepare(query).get(...params).total;
 }
 
@@ -195,10 +202,11 @@ export function countSecondarySales(contractId, nftId = null, startDate = null, 
  * Mark an array of secondary sale IDs as distributed.
  */
 export function markSalesDistributed(ids) {
-  const placeholders = ids.map(() => "?").join(",");
-  db.prepare(`UPDATE secondary_sales SET distributed = 1 WHERE id IN (${placeholders})`).run(
-    ...ids
-  );
+  db.prepare(`
+    UPDATE secondary_sales
+    SET distributed = 1
+    WHERE id IN (SELECT value FROM json_each(?))
+  `).run(JSON.stringify(ids));
   countWrite();
 }
 
@@ -215,6 +223,7 @@ export function recordSecondaryRoyaltyDistribution(
   numberOfSales,
   dustAllocated = 0
 ) {
+  assertValidContractId(contractId);
   const stmt = db.prepare(`
     INSERT INTO secondary_royalty_distributions
     (transactionId, contractId, totalRoyaltiesDistributed, numberOfSales, dustAllocated)
@@ -236,6 +245,7 @@ export function recordSecondaryRoyaltyDistribution(
  * Get secondary royalty distribution history for a contract.
  */
 export function getSecondaryRoyaltyDistributions(contractId, limit = 50, offset = 0) {
+  assertValidContractId(contractId);
   const stmt = db.prepare(`
     SELECT 
       srd.id,
@@ -328,6 +338,7 @@ const STATS_CACHE_TTL_MS = 60_000;
 
 export function _invalidateStatsCache(contractId) {
   if (contractId) {
+    assertValidContractId(contractId);
     _statsCache.delete(contractId);
   } else {
     _statsCache.clear();
@@ -335,48 +346,57 @@ export function _invalidateStatsCache(contractId) {
 }
 
 // Single CTE query combining totals, pending pool, and last distribution (#462).
-const _statsStmt = db.prepare(`
-  WITH
-    last_dist_ts AS (
-      SELECT COALESCE(MAX(timestamp), '1970-01-01') AS ts
-      FROM secondary_royalty_distributions
-      WHERE contractId = ?
-    ),
-    totals AS (
+// Prepare lazily so route-only tests can initialize the schema before use.
+let _statsStmt;
+
+function getStatsStatement() {
+  if (!_statsStmt) {
+    _statsStmt = db.prepare(`
+      WITH
+        last_dist_ts AS (
+          SELECT COALESCE(MAX(timestamp), '1970-01-01') AS ts
+          FROM secondary_royalty_distributions
+          WHERE contractId = ?
+        ),
+        totals AS (
+          SELECT
+            COUNT(*) AS count,
+            COALESCE(SUM(CAST(royaltyAmount AS REAL)), 0) AS totalRoyalties,
+            COALESCE(SUM(CAST(salePrice AS REAL)), 0) AS totalVolume
+          FROM secondary_sales
+          WHERE contractId = ?
+        ),
+        pending AS (
+          SELECT COALESCE(SUM(CAST(royaltyAmount AS REAL)), 0) AS pendingPool
+          FROM secondary_sales, last_dist_ts
+          WHERE secondary_sales.contractId = ?
+            AND secondary_sales.timestamp > last_dist_ts.ts
+        ),
+        last_dist AS (
+          SELECT srd.timestamp, srd.totalRoyaltiesDistributed, srd.numberOfSales, t.txHash
+          FROM secondary_royalty_distributions srd
+          LEFT JOIN transactions t ON srd.transactionId = t.id
+          WHERE srd.contractId = ?
+          ORDER BY srd.timestamp DESC
+          LIMIT 1
+        )
       SELECT
-        COUNT(*) AS count,
-        COALESCE(SUM(CAST(royaltyAmount AS REAL)), 0) AS totalRoyalties,
-        COALESCE(SUM(CAST(salePrice AS REAL)), 0) AS totalVolume
-      FROM secondary_sales
-      WHERE contractId = ?
-    ),
-    pending AS (
-      SELECT COALESCE(SUM(CAST(royaltyAmount AS REAL)), 0) AS pendingPool
-      FROM secondary_sales, last_dist_ts
-      WHERE secondary_sales.contractId = ?
-        AND secondary_sales.timestamp > last_dist_ts.ts
-    ),
-    last_dist AS (
-      SELECT srd.timestamp, srd.totalRoyaltiesDistributed, srd.numberOfSales, t.txHash
-      FROM secondary_royalty_distributions srd
-      LEFT JOIN transactions t ON srd.transactionId = t.id
-      WHERE srd.contractId = ?
-      ORDER BY srd.timestamp DESC
-      LIMIT 1
-    )
-  SELECT
-    totals.count          AS totalSales,
-    totals.totalRoyalties AS totalRoyalties,
-    totals.totalVolume    AS totalVolume,
-    pending.pendingPool   AS pendingPool,
-    last_dist.timestamp                  AS lastDistTimestamp,
-    last_dist.totalRoyaltiesDistributed  AS lastDistTotal,
-    last_dist.numberOfSales              AS lastDistSales,
-    last_dist.txHash                     AS lastDistTxHash
-  FROM totals
-  CROSS JOIN pending
-  LEFT JOIN last_dist ON 1=1
-`);
+        totals.count          AS totalSales,
+        totals.totalRoyalties AS totalRoyalties,
+        totals.totalVolume    AS totalVolume,
+        pending.pendingPool   AS pendingPool,
+        last_dist.timestamp                  AS lastDistTimestamp,
+        last_dist.totalRoyaltiesDistributed  AS lastDistTotal,
+        last_dist.numberOfSales              AS lastDistSales,
+        last_dist.txHash                     AS lastDistTxHash
+      FROM totals
+      CROSS JOIN pending
+      LEFT JOIN last_dist ON 1=1
+    `);
+  }
+
+  return _statsStmt;
+}
 
 /**
  * Get royalty statistics for a contract.
@@ -386,12 +406,13 @@ const _statsStmt = db.prepare(`
  * counts are integers, and null is never returned for aggregates.
  */
 export function getRoyaltyStatistics(contractId) {
+  assertValidContractId(contractId);
   const cached = _statsCache.get(contractId);
   if (cached && Date.now() - cached.ts < STATS_CACHE_TTL_MS) {
     return cached.data;
   }
 
-  const row = _statsStmt.get(contractId, contractId, contractId, contractId);
+  const row = getStatsStatement().get(contractId, contractId, contractId, contractId);
 
   const lastDistribution =
     row.lastDistTimestamp != null
@@ -413,4 +434,259 @@ export function getRoyaltyStatistics(contractId) {
 
   _statsCache.set(contractId, { ts: Date.now(), data });
   return data;
+}
+
+// ---------------------------------------------------------------------------
+// Retry Queue for Failed Secondary Royalty Distributions
+// ---------------------------------------------------------------------------
+
+/**
+ * Calculate next retry time using exponential backoff.
+ * Formula: baseDelay * (2 ^ retryCount) with jitter
+ * Max delay capped at 1 hour.
+ */
+function calculateNextRetryAt(retryCount) {
+  const baseDelayMs = 1000; // 1 second
+  const maxDelayMs = 3600000; // 1 hour
+  const exponentialDelay = baseDelayMs * Math.pow(2, retryCount);
+  const cappedDelay = Math.min(exponentialDelay, maxDelayMs);
+  // Add jitter: +/- 20% random variation
+  const jitter = cappedDelay * 0.2 * (Math.random() * 2 - 1);
+  const nextRetryDelay = cappedDelay + jitter;
+  return new Date(Date.now() + nextRetryDelay);
+}
+
+/**
+ * Add a failed distribution to the retry queue.
+ */
+export function addToRetryQueue(params) {
+  const {
+    contractId,
+    walletAddress,
+    tokenId,
+    collaborators,
+    totalRoyalties,
+    numberOfSales,
+    pendingSaleIds,
+    totalDustAllocated,
+    dustAuditData,
+    errorMessage,
+  } = params;
+  assertValidContractId(contractId);
+
+  const stmt = db.prepare(`
+    INSERT INTO secondary_royalty_retry_queue
+    (contractId, walletAddress, tokenId, collaborators, totalRoyalties, numberOfSales,
+     pendingSaleIds, totalDustAllocated, dustAuditData, errorMessage, retryCount, nextRetryAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+  `);
+
+  const nextRetryAt = calculateNextRetryAt(0);
+
+  stmt.run(
+    contractId,
+    walletAddress,
+    tokenId,
+    collaborators ? JSON.stringify(collaborators) : null,
+    totalRoyalties.toString(),
+    numberOfSales,
+    JSON.stringify(pendingSaleIds),
+    totalDustAllocated.toString(),
+    dustAuditData ? JSON.stringify(dustAuditData) : null,
+    errorMessage,
+    nextRetryAt.toISOString()
+  );
+  countWrite();
+
+  logger.info("Added failed distribution to retry queue", {
+    contractId,
+    tokenId,
+    retryCount: 0,
+    nextRetryAt: nextRetryAt.toISOString(),
+  });
+}
+
+/**
+ * Get items from retry queue that are ready for retry.
+ */
+export function getReadyRetryItems(limit = 10) {
+  const stmt = db.prepare(`
+    SELECT
+      id,
+      contractId,
+      walletAddress,
+      tokenId,
+      collaborators,
+      totalRoyalties,
+      numberOfSales,
+      pendingSaleIds,
+      totalDustAllocated,
+      dustAuditData,
+      errorMessage,
+      retryCount
+    FROM secondary_royalty_retry_queue
+    WHERE nextRetryAt <= datetime('now')
+    ORDER BY nextRetryAt ASC
+    LIMIT ?
+  `);
+
+  const items = stmt.all(limit);
+  return items.map((item) => ({
+    ...item,
+    collaborators: item.collaborators ? JSON.parse(item.collaborators) : null,
+    pendingSaleIds: JSON.parse(item.pendingSaleIds),
+    dustAuditData: item.dustAuditData ? JSON.parse(item.dustAuditData) : null,
+  }));
+}
+
+/**
+ * Update retry item with new error and increment retry count.
+ */
+export function updateRetryItem(id, errorMessage) {
+  const item = db.prepare("SELECT retryCount FROM secondary_royalty_retry_queue WHERE id = ?").get(id);
+  if (!item) return false;
+
+  const newRetryCount = item.retryCount + 1;
+  const nextRetryAt = calculateNextRetryAt(newRetryCount);
+
+  const stmt = db.prepare(`
+    UPDATE secondary_royalty_retry_queue
+    SET errorMessage = ?,
+        retryCount = ?,
+        nextRetryAt = ?,
+        lastAttemptAt = datetime('now')
+    WHERE id = ?
+  `);
+
+  stmt.run(errorMessage, newRetryCount, nextRetryAt.toISOString(), id);
+  countWrite();
+
+  logger.info("Updated retry item", {
+    id,
+    retryCount: newRetryCount,
+    nextRetryAt: nextRetryAt.toISOString(),
+  });
+
+  return true;
+}
+
+/**
+ * Remove item from retry queue after successful retry.
+ */
+export function removeFromRetryQueue(id) {
+  const stmt = db.prepare("DELETE FROM secondary_royalty_retry_queue WHERE id = ?");
+  stmt.run(id);
+  countWrite();
+
+  logger.info("Removed item from retry queue after success", { id });
+}
+
+/**
+ * Move item from retry queue to dead-letter queue after max retries.
+ */
+export function moveToDeadLetterQueue(id, failureReason) {
+  const item = db.prepare(`
+    SELECT contractId, walletAddress, tokenId, collaborators, totalRoyalties,
+           numberOfSales, pendingSaleIds, totalDustAllocated, dustAuditData,
+           errorMessage, retryCount
+    FROM secondary_royalty_retry_queue
+    WHERE id = ?
+  `).get(id);
+
+  if (!item) return false;
+
+  const stmt = db.prepare(`
+    INSERT INTO secondary_royalty_dlq
+    (contractId, walletAddress, tokenId, collaborators, totalRoyalties, numberOfSales,
+     pendingSaleIds, totalDustAllocated, dustAuditData, errorMessage, failureReason, retryCount)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    item.contractId,
+    item.walletAddress,
+    item.tokenId,
+    item.collaborators,
+    item.totalRoyalties,
+    item.numberOfSales,
+    item.pendingSaleIds,
+    item.totalDustAllocated,
+    item.dustAuditData,
+    item.errorMessage,
+    failureReason,
+    item.retryCount
+  );
+  countWrite();
+
+  // Remove from retry queue
+  db.prepare("DELETE FROM secondary_royalty_retry_queue WHERE id = ?").run(id);
+  countWrite();
+
+  logger.error("Moved failed distribution to dead-letter queue", {
+    contractId: item.contractId,
+    tokenId: item.tokenId,
+    retryCount: item.retryCount,
+    failureReason,
+  });
+
+  return true;
+}
+
+/**
+ * Get dead-letter queue items for a contract.
+ */
+export function getDeadLetterItems(contractId, limit = 50, offset = 0) {
+  assertValidContractId(contractId);
+  const stmt = db.prepare(`
+    SELECT
+      id,
+      contractId,
+      walletAddress,
+      tokenId,
+      totalRoyalties,
+      numberOfSales,
+      errorMessage,
+      failureReason,
+      retryCount,
+      createdAt,
+      failedAt
+    FROM secondary_royalty_dlq
+    WHERE contractId = ?
+    ORDER BY createdAt DESC
+    LIMIT ? OFFSET ?
+  `);
+
+  return stmt.all(contractId, limit, offset);
+}
+
+/**
+ * Get retry queue statistics.
+ */
+export function getRetryQueueStats() {
+  const stmt = db.prepare(`
+    SELECT
+      COUNT(*) as totalItems,
+      AVG(retryCount) as avgRetryCount,
+      MAX(retryCount) as maxRetryCount,
+      COUNT(CASE WHEN nextRetryAt <= datetime('now') THEN 1 END) as readyForRetry
+    FROM secondary_royalty_retry_queue
+  `);
+
+  return stmt.get();
+}
+
+/**
+ * Get dead-letter queue statistics.
+ */
+export function getDeadLetterQueueStats() {
+  const stmt = db.prepare(`
+    SELECT
+      COUNT(*) as totalItems,
+      AVG(retryCount) as avgRetryCount,
+      MAX(retryCount) as maxRetryCount,
+      COUNT(CASE WHEN createdAt >= datetime('now', '-7 days') THEN 1 END) as last7Days
+    FROM secondary_royalty_dlq
+  `);
+
+  return stmt.get();
 }

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { sendError, sendValidationError } from "./error-response.js";
+import { CONTRACT_ID_PATTERN, isValidContractId } from "./contract-id.js";
 
 export const stellarAddress = z
   .string("Validation failed: walletAddress must be a string")
@@ -7,7 +8,7 @@ export const stellarAddress = z
 
 export const contractAddress = z
   .string("Validation failed: contractId must be a string")
-  .regex(/^C[A-Z2-7]{55}$/, "Validation failed: Invalid contract address");
+  .regex(CONTRACT_ID_PATTERN, "Validation failed: Invalid contract address");
 
 export const basisPoints = z.number().int().min(0).max(10000);
 
@@ -80,6 +81,14 @@ export const distributeSecondarySchema = z.object({
   contractId: contractAddress,
   walletAddress: stellarAddress,
   tokenId: contractAddress,
+  collaborators: z
+    .array(
+      z.object({
+        address: stellarAddress,
+        basisPoints: basisPoints,
+      })
+    )
+    .optional(),
 });
 
 export const webhookRegisterSchema = z.object({
@@ -180,7 +189,7 @@ export function validateInitializePayloadSize(req, res, next) {
  */
 export function validateContractIdMiddleware(req, res, next) {
   const contractId = req.params.contractId;
-  if (!contractId || !/^C[A-Z2-7]{55}$/.test(contractId)) {
+  if (!isValidContractId(contractId)) {
     return sendError(res, 400, "invalid_contract_id", "Invalid contract ID format");
   }
   next();
@@ -191,7 +200,7 @@ export function validateContractIdMiddleware(req, res, next) {
  * Returns true if valid, otherwise sends a 400 and returns false.
  */
 export function validateContractId(contractId, res) {
-  if (!/^C[A-Z2-7]{55}$/.test(contractId)) {
+  if (!isValidContractId(contractId)) {
     sendError(res, 400, "invalid_contract_id", "Invalid contract ID format");
     return false;
   }
@@ -269,11 +278,11 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
     items = body.recipients.map((r, idx) => ({
       address: r.address ?? r.recipient ?? r.walletAddress ?? "",
       percentage: typeof r.percentage === "number" ? r.percentage : (typeof r.share === "number" ? r.share / 100 : null),
-      share: typeof r.share === "number" ? r.share : (typeof r.percentage === "number" ? Math.round(r.percentage * 100) : null),
+      share: typeof r.share === "number" ? r.share : (typeof r.percentage === "number" ? Number((r.percentage * 100).toFixed(4)) : null),
       path: `recipients.${idx}`,
     }));
   } else if (Array.isArray(body.recipients) && typeof body.recipients[0] === "string") {
-    const shares = body.shares ?? body.percentages?.map((p) => Math.round(p * 100)) ?? [];
+    const shares = body.shares ?? body.percentages?.map((p) => Number((p * 100).toFixed(4))) ?? [];
     const percentages = body.percentages ?? body.shares?.map((s) => s / 100) ?? [];
     if (body.recipients.length !== (body.percentages ?? body.shares ?? []).length) {
       return sendError(res, 400, "validation_error", "Validation failed: recipients and percentages/shares arrays must be the same length");
@@ -285,7 +294,7 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
       path: `recipients.${idx}`,
     }));
   } else if (Array.isArray(body.collaborators)) {
-    const shares = body.shares ?? body.percentages?.map((p) => Math.round(p * 100)) ?? [];
+    const shares = body.shares ?? body.percentages?.map((p) => Number((p * 100).toFixed(4))) ?? [];
     const percentages = body.percentages ?? body.shares?.map((s) => s / 100) ?? [];
     if (body.collaborators.length !== (body.shares ?? body.percentages ?? []).length) {
       return sendError(res, 400, "validation_error", "Validation failed: collaborators and shares/percentages arrays must be the same length");
@@ -301,7 +310,8 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
   }
 
   if (items.length === 0) {
-    return sendError(res, 400, "validation_error", "Validation failed: Recipients array must be non-empty");
+    const collectionName = Array.isArray(body.collaborators) ? "Collaborators" : "Recipients";
+    return sendError(res, 400, "validation_error", `Validation failed: ${collectionName} array must be non-empty`);
   }
 
   if (items.length > 20) {
@@ -321,6 +331,11 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
         field: `${item.path}.share`,
         message: "Validation failed: Percentage or share must be a positive number",
       });
+    } else if (!Number.isInteger(item.share)) {
+      issues.push({
+        field: `${item.path}.share`,
+        message: "Validation failed: Share must be an integer (fractional basis points are not allowed)",
+      });
     }
   }
 
@@ -333,7 +348,7 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
     const actualPct = totalShares / 100;
     return sendValidationError(res, [{
       field: "shares",
-      message: `Validation failed: percentages must sum to exactly 100 (got ${actualPct}%, expected 100%)`,
+      message: `Validation failed: percentages must sum to exactly 100 (got ${actualPct}% / ${totalShares} basis points, expected 100% / 10000 basis points)`,
     }]);
   }
 
@@ -349,3 +364,16 @@ export function validateRoyaltySplitMiddleware(req, res, next) {
 
 export const validateRoyaltySplitPayload = validateRoyaltySplitMiddleware;
 export const validateRoyaltySplit = validateRoyaltySplitMiddleware;
+
+export const assignRoleSchema = z.object({
+  contractId: contractAddress.nullable().optional(),
+  walletAddress: stellarAddress,
+  role: z.enum(["viewer", "operator", "admin"]),
+});
+
+export const batchDistributeSchema = z.object({
+  contractId: contractAddress,
+  walletAddress: stellarAddress,
+  tokenIds: z.array(contractAddress).min(1, "At least one token is required").max(10, "Cannot batch more than 10 tokens"),
+});
+
