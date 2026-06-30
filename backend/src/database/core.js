@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import crypto from "crypto";
 import logger from "../logger.js";
 import { instrumentDatabase } from "../query-profiler.js";
+import { assertValidContractId } from "../contract-id.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.DATABASE_PATH ?? path.join(__dirname, "..", "..", "audit.db");
@@ -392,15 +393,16 @@ export function initializeDatabase() {
     },
   ];
 
-  const applied = db
+  const applied = new Set(db
     .prepare("SELECT version FROM schema_migrations")
     .all()
-    .map((r) => r.version);
+    .map((r) => r.version));
 
   for (const migration of migrations) {
-    if (!applied.includes(migration.version)) {
+    if (!applied.has(migration.version)) {
       db.exec(migration.sql);
       db.prepare("INSERT INTO schema_migrations (version) VALUES (?)").run(migration.version);
+      applied.add(migration.version);
       logger.info(`Applied migration v${migration.version}`);
     }
   }
@@ -533,18 +535,18 @@ export function computeAuditEntryHash(contractId, action, user, details, timesta
  */
 export function verifyAuditLogIntegrity(contractId = null) {
   try {
-    let query = `
+    if (contractId !== null) {
+      assertValidContractId(contractId);
+    }
+
+    const whereClause = contractId ? "WHERE contractId = ?" : "";
+    const query = `
       SELECT id, contractId, action, user, details, entry_hash, prev_hash, timestamp
       FROM audit_log
+      ${whereClause}
+      ORDER BY id ASC
     `;
-    const params = [];
-    
-    if (contractId) {
-      query += ` WHERE contractId = ?`;
-      params.push(contractId);
-    }
-    
-    query += ` ORDER BY id ASC`;
+    const params = contractId ? [contractId] : [];
     
     const entries = db.prepare(query).all(...params);
     
