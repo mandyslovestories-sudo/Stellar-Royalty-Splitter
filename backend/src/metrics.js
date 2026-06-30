@@ -18,6 +18,8 @@ const metrics = {
   transactionsFailedTotal: 0,
   horizonResponseTimeMsTotal: 0,
   horizonResponseTimeCount: 0,
+  rejectedRequestsTotal: 0,
+  trackedTransactionsTotal: 0,
 
   // ── #396: HTTP request tracking ───────────────────────────────────────
   /** Map<"METHOD /path status"> → count */
@@ -36,6 +38,13 @@ const metrics = {
   // ── #422: RPC response cache hit/miss tracking ─────────────────────────
   /** Map<cacheName> → { hits, misses } */
   cacheStats: new Map(),
+
+  // #510: Contract state consistency verification
+  contractConsistencyChecksTotal: 0,
+  contractConsistencyFailuresTotal: 0,
+  contractConsistencyDiscrepanciesTotal: 0,
+  contractConsistencyLastDiscrepancyCount: 0,
+  contractConsistencyLastRunTimestamp: 0,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -72,6 +81,14 @@ export function recordHorizonResponseTime(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs < 0) return;
   metrics.horizonResponseTimeMsTotal += durationMs;
   metrics.horizonResponseTimeCount += 1;
+}
+
+export function recordRejectedRequest() {
+  metrics.rejectedRequestsTotal += 1;
+}
+
+export function recordTrackedTransaction() {
+  metrics.trackedTransactionsTotal += 1;
 }
 
 // ── #396: New recorders ───────────────────────────────────────────────────
@@ -143,6 +160,19 @@ export function recordCacheMiss(cacheName) {
   getCacheEntry(cacheName).misses += 1;
 }
 
+export function recordContractConsistencyCheck({ success, discrepancyCount = 0 } = {}) {
+  const count = Number.isFinite(discrepancyCount) ? Math.max(0, discrepancyCount) : 0;
+
+  metrics.contractConsistencyChecksTotal += 1;
+  metrics.contractConsistencyLastRunTimestamp = Math.floor(Date.now() / 1000);
+  metrics.contractConsistencyLastDiscrepancyCount = count;
+  metrics.contractConsistencyDiscrepanciesTotal += count;
+
+  if (!success) {
+    metrics.contractConsistencyFailuresTotal += 1;
+  }
+}
+
 // ── Snapshot ──────────────────────────────────────────────────────────────
 
 export function getMetricsSnapshot() {
@@ -161,6 +191,8 @@ export function getMetricsSnapshot() {
     horizonResponseTimeMsTotal: metrics.horizonResponseTimeMsTotal,
     horizonResponseTimeCount: metrics.horizonResponseTimeCount,
     averageHorizonResponseTimeMs,
+    rejectedRequestsTotal: metrics.rejectedRequestsTotal,
+    trackedTransactionsTotal: metrics.trackedTransactionsTotal,
 
     // #396
     httpRequestCounts: Object.fromEntries(metrics.httpRequestCounts),
@@ -179,6 +211,14 @@ export function getMetricsSnapshot() {
 
     // #422
     cacheStats: Object.fromEntries(metrics.cacheStats),
+
+    // #510
+    contractConsistencyChecksTotal: metrics.contractConsistencyChecksTotal,
+    contractConsistencyFailuresTotal: metrics.contractConsistencyFailuresTotal,
+    contractConsistencyDiscrepanciesTotal: metrics.contractConsistencyDiscrepanciesTotal,
+    contractConsistencyLastDiscrepancyCount:
+      metrics.contractConsistencyLastDiscrepancyCount,
+    contractConsistencyLastRunTimestamp: metrics.contractConsistencyLastRunTimestamp,
   };
 }
 
@@ -200,6 +240,9 @@ export function prometheusMetrics() {
     "# HELP stellar_horizon_response_time_average_ms Average Horizon response time in milliseconds.",
     "# TYPE stellar_horizon_response_time_average_ms gauge",
     `stellar_horizon_response_time_average_ms ${formatMetricValue(snapshot.averageHorizonResponseTimeMs)}`,
+    "# HELP stellar_tracked_transactions_total Total number of tracked request transactions.",
+    "# TYPE stellar_tracked_transactions_total counter",
+    `stellar_tracked_transactions_total ${snapshot.trackedTransactionsTotal}`,
     "# HELP stellar_horizon_response_time_count Horizon response time observations.",
     "# TYPE stellar_horizon_response_time_count counter",
     `stellar_horizon_response_time_count ${snapshot.horizonResponseTimeCount}`,
@@ -272,6 +315,25 @@ export function prometheusMetrics() {
     lines.push(`stellar_cache_misses_total{cache="${cache}"} ${v.misses}`);
   }
 
+  // #510 — contract state consistency alerts
+  lines.push(
+    "# HELP stellar_contract_consistency_checks_total Contract state consistency verification runs.",
+    "# TYPE stellar_contract_consistency_checks_total counter",
+    `stellar_contract_consistency_checks_total ${snapshot.contractConsistencyChecksTotal}`,
+    "# HELP stellar_contract_consistency_failures_total Contract state consistency verification runs that failed before comparison completed.",
+    "# TYPE stellar_contract_consistency_failures_total counter",
+    `stellar_contract_consistency_failures_total ${snapshot.contractConsistencyFailuresTotal}`,
+    "# HELP stellar_contract_consistency_discrepancies_total Total DB versus on-chain state discrepancies found.",
+    "# TYPE stellar_contract_consistency_discrepancies_total counter",
+    `stellar_contract_consistency_discrepancies_total ${snapshot.contractConsistencyDiscrepanciesTotal}`,
+    "# HELP stellar_contract_consistency_last_discrepancy_count Discrepancies found during the latest consistency verification run.",
+    "# TYPE stellar_contract_consistency_last_discrepancy_count gauge",
+    `stellar_contract_consistency_last_discrepancy_count ${snapshot.contractConsistencyLastDiscrepancyCount}`,
+    "# HELP stellar_contract_consistency_last_run_timestamp_seconds Unix timestamp for the latest consistency verification run.",
+    "# TYPE stellar_contract_consistency_last_run_timestamp_seconds gauge",
+    `stellar_contract_consistency_last_run_timestamp_seconds ${snapshot.contractConsistencyLastRunTimestamp}`,
+  );
+
   lines.push("");
   return lines.join("\n");
 }
@@ -284,10 +346,17 @@ export function resetMetrics() {
   metrics.transactionsFailedTotal = 0;
   metrics.horizonResponseTimeMsTotal = 0;
   metrics.horizonResponseTimeCount = 0;
+  metrics.rejectedRequestsTotal = 0;
+  metrics.trackedTransactionsTotal = 0;
   metrics.httpRequestCounts.clear();
   metrics.responseTimeObservations.length = 0;
   metrics.requestBytesTotal = 0;
   metrics.responseBytesTotal = 0;
   metrics.stellarRpcCalls.clear();
   metrics.cacheStats.clear();
+  metrics.contractConsistencyChecksTotal = 0;
+  metrics.contractConsistencyFailuresTotal = 0;
+  metrics.contractConsistencyDiscrepanciesTotal = 0;
+  metrics.contractConsistencyLastDiscrepancyCount = 0;
+  metrics.contractConsistencyLastRunTimestamp = 0;
 }

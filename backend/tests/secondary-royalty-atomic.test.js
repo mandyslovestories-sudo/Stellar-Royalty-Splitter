@@ -24,6 +24,13 @@ await jest.unstable_mockModule("../src/stellar.js", () => ({
   networkPassphrase: "Test SDF Network ; September 2015",
 }));
 
+// --- XDR validation mock --------------------------------------------------
+// Placeholder XDR strings used in these tests aren't real envelopes, so stub
+// the validator to accept them; dedicated tests cover the validation itself.
+await jest.unstable_mockModule("../src/xdr-validation.js", () => ({
+  validateXdrStructure: () => ({ valid: true }),
+}));
+
 // --- Database mock --------------------------------------------------------
 const getSecondarySales = jest.fn();
 const commitSecondaryDistributionAtomic = jest.fn();
@@ -36,8 +43,15 @@ const getSecondaryRoyaltyDistributions = jest.fn();
 const countSecondarySales = jest.fn();
 const initializeDatabase = jest.fn();
 const getMigrationVersion = jest.fn(() => 7);
+const addToRetryQueue = jest.fn();
+const getRetryQueueStats = jest.fn(() => ({ count: 0 }));
+const getDeadLetterQueueStats = jest.fn(() => ({ count: 0 }));
+const getDeadLetterItems = jest.fn(() => []);
 
 await jest.unstable_mockModule("../src/database/index.js", () => ({
+  db: {
+    transaction: (fn) => fn,
+  },
   getSecondarySales,
   commitSecondaryDistributionAtomic,
   applyLargestRemainder,
@@ -49,6 +63,10 @@ await jest.unstable_mockModule("../src/database/index.js", () => ({
   countSecondarySales,
   initializeDatabase,
   getMigrationVersion,
+  addToRetryQueue,
+  getRetryQueueStats,
+  getDeadLetterQueueStats,
+  getDeadLetterItems,
 }));
 
 // --- Build test app after mocks ------------------------------------------
@@ -112,7 +130,7 @@ describe("POST /api/v1/secondary-royalty/distribute — atomic DB commit (#471)"
 
     const res = await request(app).post("/api/v1/secondary-royalty/distribute").send(VALID_BODY);
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(503);
     // The atomic commit must NEVER be called when buildTx fails
     expect(commitSecondaryDistributionAtomic).not.toHaveBeenCalled();
   });

@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from "react";
-import { api } from "../api";
+import React, { useEffect, useMemo, useState } from "react";
+import { api, type CollaboratorSuggestion } from "../api";
 import { signAndSubmitTransaction } from "../stellar";
 import { useNetwork } from "../context/NetworkContext";
 import FormStatus from "./FormStatus";
+import FormInput from "./FormInput";
 import { useFormStatus } from "../hooks/useFormStatus";
 import {
   bytesToHex,
@@ -33,16 +34,20 @@ interface Collaborator {
   basisPoints: string;
 }
 
+type CollaboratorField = "address" | "basisPoints";
+type FieldErrors = Record<number, { address?: string; basisPoints?: string }>;
+
 interface Props {
   contractId: string;
   walletAddress: string;
   onSuccess: () => void;
 }
 
-const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
 const MAX_COLLABORATORS = 50;
 const BASIS_POINTS_TOTAL = 10_000;
-const PERCENTAGE_INPUT_RE = /^(\d+(\.\d{0,2})?|\.\d{1,2})?$/;
+const VALIDATION_DEBOUNCE_MS = 300;
+const VALIDATION_CACHE_LIMIT = 500;
+const PERCENTAGE_INPUT_RE = /^(\d+(\.\d*)?|\.\d+)?$/;
 const SIGNED_PERCENTAGE_INPUT_RE = /^-(\d+(\.\d*)?|\.\d+)$/;
 const PERCENTAGE_NAVIGATION_KEYS = [
   "Backspace",
@@ -63,15 +68,15 @@ function getPercentageError(value: string) {
   if (SIGNED_PERCENTAGE_INPUT_RE.test(value)) {
     return "Percentage must be between 0 and 100.";
   }
-  if (/^\d+(\.\d{3,})$|^\.\d{3,}$/.test(value)) {
-    return "Percentage supports up to 2 decimal places.";
-  }
-  if (!PERCENTAGE_INPUT_RE.test(value)) return "Percentage must be a number.";
-
   const numericValue = Number(value);
   if (Number.isNaN(numericValue)) return "Percentage must be a number.";
   if (numericValue < 0 || numericValue > 100) {
     return "Percentage must be between 0 and 100.";
+  }
+
+  const basisPoints = Number((numericValue * 100).toFixed(4));
+  if (!Number.isInteger(basisPoints)) {
+    return "Fractional basis points are not allowed.";
   }
 
   return "";
@@ -84,7 +89,7 @@ function isAllowedPercentageInput(value: string) {
 function parsePercentageToBasisPoints(value: string) {
   const error = getPercentageError(value);
   if (error) return null;
-  return Math.round(Number(value) * 100);
+  return Number((Number(value) * 100).toFixed(4));
 }
 
 function formatBasisPointsAsPercent(basisPoints: number) {
@@ -115,22 +120,6 @@ function calculateEvenSplit(collaboratorCount: number) {
   );
 }
 
-function updatePercentageError(
-  setErrors: React.Dispatch<
-    React.SetStateAction<Record<number, { address?: string; basisPoints?: string }>>
-  >,
-  i: number,
-  error: string,
-) {
-  setErrors((prev) => ({
-    ...prev,
-    [i]: {
-      ...prev[i],
-      basisPoints: error,
-    },
-  }));
-}
-
 function handlePercentageKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
   if (
     event.ctrlKey ||
@@ -150,6 +139,42 @@ function handlePercentageKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
   }
 }
 
+function getFieldValidationError(field: CollaboratorField, value: string) {
+  if (field === "address") {
+    return value && !STELLAR_ADDRESS_RE.test(value)
+      ? "Must be a valid Stellar address (G..., 56 chars)"
+      : "";
+  }
+
+  return getPercentageError(value);
+}
+
+function setFieldError(
+  setErrors: React.Dispatch<React.SetStateAction<FieldErrors>>,
+  i: number,
+  field: CollaboratorField,
+  error: string,
+) {
+  setErrors((prev) => {
+    const nextRow = { ...(prev[i] ?? {}) };
+
+    if (error) {
+      nextRow[field] = error;
+    } else {
+      delete nextRow[field];
+    }
+
+    const next = { ...prev };
+    if (nextRow.address || nextRow.basisPoints) {
+      next[i] = nextRow;
+    } else {
+      delete next[i];
+    }
+
+    return next;
+  });
+}
+
 export default function InitializeForm({
   contractId,
   walletAddress,
@@ -159,13 +184,21 @@ export default function InitializeForm({
   const [collaborators, setCollaborators] = useState<Collaborator[]>([
     { address: "", basisPoints: "" },
   ]);
-  const [errors, setErrors] = useState<
-    Record<number, { address?: string; basisPoints?: string }>
-  >({});
+  const [errors, setErrors] = useState<FieldErrors>({});
   const { status, setStatus } = useFormStatus();
   const [loading, setLoading] = useState(false);
   const [phase, setPhase] = useState<InitPhase>("form");
   const [pendingCommit, setPendingCommit] = useState<InitCommitState | null>(null);
+  const [suggestions, setSuggestions] = useState<Record<number, CollaboratorSuggestion[]>>({});
+  const [focusedAddressIndex, setFocusedAddressIndex] = useState<number | null>(null);
+  const [lookupLoading, setLookupLoading] = useState<Record<number, boolean>>({});
+  const validationTimers = React.useRef(new Map<string, number>());
+  const validationCache = React.useRef(new Map<string, string>());
+
+  const selectedAddresses = useMemo(
+    () => new Set(collaborators.map((collaborator) => collaborator.address.trim()).filter(Boolean)),
+    [collaborators],
+  );
 
   useEffect(() => {
     const saved = loadCommitState(contractId);
@@ -175,46 +208,85 @@ export default function InitializeForm({
     }
   }, [contractId]);
 
+  useEffect(() => {
+    return () => {
+      validationTimers.current.forEach((timer) => window.clearTimeout(timer));
+      validationTimers.current.clear();
+      validationCache.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    const timers = collaborators.map((collaborator, index) => {
+      const query = collaborator.address.trim();
+      setLookupLoading((prev) => ({ ...prev, [index]: true }));
+
+      return window.setTimeout(async () => {
+        try {
+          const result = await api.lookupCollaborators(query, 8);
+          setSuggestions((prev) => ({
+            ...prev,
+            [index]: result.suggestions.filter(
+              (suggestion) => suggestion.address === query || !selectedAddresses.has(suggestion.address),
+            ),
+          }));
+        } catch {
+          setSuggestions((prev) => ({ ...prev, [index]: [] }));
+        } finally {
+          setLookupLoading((prev) => ({ ...prev, [index]: false }));
+        }
+      }, 250);
+    });
+
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [collaborators, selectedAddresses]);
+
   function update(i: number, field: keyof Collaborator, value: string) {
     setCollaborators((prev: Collaborator[]) =>
       prev.map((c: Collaborator, idx: number) => (idx === i ? { ...c, [field]: value } : c)),
     );
   }
 
-  function validateRow(
-    i: number,
-    field: "address" | "basisPoints",
-    value: string,
-  ) {
-    const rowErrors = { ...errors };
-    if (field === "address") {
-      if (value && !STELLAR_ADDRESS_RE.test(value)) {
-        rowErrors[i] = {
-          ...rowErrors[i],
-          address: "Must be a valid Stellar address (G..., 56 chars)",
-        };
-      } else {
-        const { address: _, ...rest } = rowErrors[i] ?? {};
-        rowErrors[i] = rest;
-      }
-    }
-    if (field === "basisPoints") {
-      const percentageError = getPercentageError(value);
-      if (percentageError) {
-        rowErrors[i] = {
-          ...rowErrors[i],
-          basisPoints: percentageError,
-        };
-      } else {
-        const { basisPoints: _, ...rest } = rowErrors[i] ?? {};
-        rowErrors[i] = rest;
-      }
-    }
-    setErrors(rowErrors);
+  function selectSuggestion(i: number, address: string) {
+    update(i, "address", address);
+    scheduleValidation(i, "address", address);
+    setFocusedAddressIndex(null);
   }
 
-  function handleBlur(i: number, field: "address" | "basisPoints", value: string) {
-    validateRow(i, field, value);
+  function getCachedFieldError(field: CollaboratorField, value: string) {
+    const cacheKey = `${field}:${value}`;
+    const cached = validationCache.current.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const error = getFieldValidationError(field, value);
+    validationCache.current.set(cacheKey, error);
+    if (validationCache.current.size > VALIDATION_CACHE_LIMIT) {
+      const oldestKey = validationCache.current.keys().next().value;
+      if (oldestKey) validationCache.current.delete(oldestKey);
+    }
+
+    return error;
+  }
+
+  function scheduleValidation(
+    i: number,
+    field: CollaboratorField,
+    value: string,
+  ) {
+    const fieldKey = `${i}:${field}`;
+    const existingTimer = validationTimers.current.get(fieldKey);
+    if (existingTimer) window.clearTimeout(existingTimer);
+
+    const timer = window.setTimeout(() => {
+      validationTimers.current.delete(fieldKey);
+      setFieldError(setErrors, i, field, getCachedFieldError(field, value));
+    }, VALIDATION_DEBOUNCE_MS);
+
+    validationTimers.current.set(fieldKey, timer);
+  }
+
+  function handleBlur(i: number, field: CollaboratorField, value: string) {
+    scheduleValidation(i, field, value);
   }
 
   function addRow() {
@@ -223,8 +295,15 @@ export default function InitializeForm({
 
   function removeRow(i: number) {
     setCollaborators((prev: Collaborator[]) => prev.filter((_: Collaborator, idx: number) => idx !== i));
-    setErrors((prev: Record<number, { address?: string; basisPoints?: string }>) => {
-      const next: Record<number, { address?: string; basisPoints?: string }> = {};
+    validationTimers.current.forEach((timer, key) => {
+      const [rowIndex] = key.split(":");
+      if (Number(rowIndex) >= i) {
+        window.clearTimeout(timer);
+        validationTimers.current.delete(key);
+      }
+    });
+    setErrors((prev: FieldErrors) => {
+      const next: FieldErrors = {};
       Object.entries(prev).forEach(([key, val]) => {
         const k = parseInt(key);
         if (k < i) next[k] = val;
@@ -242,6 +321,12 @@ export default function InitializeForm({
         basisPoints: evenShares[index],
       })),
     );
+    validationTimers.current.forEach((timer, key) => {
+      if (key.endsWith(":basisPoints")) {
+        window.clearTimeout(timer);
+        validationTimers.current.delete(key);
+      }
+    });
     setErrors((prev) => {
       const next = { ...prev };
       collaborators.forEach((_, index) => {
@@ -254,7 +339,7 @@ export default function InitializeForm({
 
   const shareSummary = calculateShareSummary(collaborators);
 
-  const hasErrors = Object.values(errors).some((e) => (e as { address?: string; basisPoints?: string })?.address || (e as { address?: string; basisPoints?: string })?.basisPoints);
+  const hasErrors = Object.values(errors).some((e) => e?.address || e?.basisPoints);
   const hasEmptyFields = collaborators.some((c: Collaborator) => !c.address || !c.basisPoints);
   const hasInvalidPercentages = collaborators.some((c: Collaborator) => getPercentageError(c.basisPoints));
   const canSubmit =
@@ -378,14 +463,20 @@ export default function InitializeForm({
       setPendingCommit(null);
       setPhase("form");
       setStatus("ok", `Initialized. Tx: ${hash}`);
+      reset();
       onSuccess();
     } catch (e: unknown) {
       const errorMessage = e instanceof Error ? e.message : "Unknown error";
-      setStatus("error", errorMessage);
-    } finally {
-      setLoading(false);
+      if (errorMessage.includes("409") || errorMessage.includes("already initialized")) {
+        setStatus(
+          "error",
+          "⚠️ This contract is already initialized. You cannot re-initialize an existing contract."
+        );
+      } else {
+        setStatus("error", errorMessage);
+      }
     }
-  }
+  };
 
   return (
     <div className="card">
@@ -408,19 +499,62 @@ export default function InitializeForm({
               <div key={i}>
                 <div className="collaborator-row">
                   <div className="collaborator-address-field">
-                    <input
-                      placeholder="Wallet address (G...)"
-                      value={c.address}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => update(i, "address", e.target.value)}
-                      onBlur={(e: React.FocusEvent<HTMLInputElement>) => handleBlur(i, "address", e.target.value)}
-                      style={{ marginBottom: errors[i]?.address ? "0.25rem" : undefined }}
-                    />
-                    {errors[i]?.address && (
-                      <span className="field-error">{errors[i].address}</span>
-                    )}
+                    <div className="autocomplete-field">
+                      <FormInput
+                        placeholder="Wallet address (G...)"
+                        value={c.address}
+                        error={errors[i]?.address}
+                        showSuccess={Boolean(c.address) && STELLAR_ADDRESS_RE.test(c.address) && !errors[i]?.address}
+                        role="combobox"
+                        aria-autocomplete="list"
+                        aria-expanded={focusedAddressIndex === i && (suggestions[i]?.length ?? 0) > 0}
+                        aria-controls={`collaborator-${i}-suggestions`}
+                        aria-label={`Wallet address for collaborator ${i + 1}`}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                          update(i, "address", e.target.value);
+                          scheduleValidation(i, "address", e.target.value);
+                        }}
+                        onFocus={() => setFocusedAddressIndex(i)}
+                        onBlur={(e: React.FocusEvent<HTMLInputElement>) => {
+                          handleBlur(i, "address", e.target.value);
+                          window.setTimeout(() => setFocusedAddressIndex(null), 150);
+                        }}
+                      />
+                      <span id={`collaborator-${i}-lookup-help`} className="sr-only">
+                        Start typing to search previous collaborators. Suggestions are filtered to avoid duplicate
+                        addresses.
+                      </span>
+                      {focusedAddressIndex === i && (suggestions[i]?.length ?? 0) > 0 && (
+                        <ul
+                          id={`collaborator-${i}-suggestions`}
+                          className="autocomplete-list"
+                          role="listbox"
+                          aria-label={`Collaborator suggestions for row ${i + 1}`}
+                        >
+                          {suggestions[i].map((suggestion) => (
+                            <li key={suggestion.address} role="option" aria-selected={false}>
+                              <button
+                                type="button"
+                                className="autocomplete-option"
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => selectSuggestion(i, suggestion.address)}
+                              >
+                                <span>{suggestion.label}</span>
+                                <small>{suggestion.sources.includes("initialize_history") ? "History" : "Payout"}</small>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {focusedAddressIndex === i && lookupLoading[i] && (
+                        <span className="autocomplete-loading" aria-live="polite">
+                          Searching collaborators...
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="collaborator-share-field">
-                    <input
+                    <FormInput
                       placeholder="% (0–100)"
                       type="text"
                       inputMode="decimal"
@@ -429,26 +563,22 @@ export default function InitializeForm({
                       step="any"
                       value={c.basisPoints}
                       className={highlightShare ? "input-error" : ""}
+                      error={percentageError}
+                      showSuccess={Boolean(c.basisPoints) && !percentageError && !getPercentageError(c.basisPoints)}
                       aria-label={`Royalty percentage for collaborator ${i + 1}`}
-                      aria-invalid={highlightShare}
-                      aria-describedby={percentageError ? `collaborator-${i}-percentage-error` : undefined}
                       onKeyDown={handlePercentageKeyDown}
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                         const { value } = e.target;
                         if (!isAllowedPercentageInput(value)) {
                           update(i, "basisPoints", value);
-                          updatePercentageError(setErrors, i, getPercentageError(value));
+                          scheduleValidation(i, "basisPoints", value);
                           return;
                         }
                         update(i, "basisPoints", value);
-                        validateRow(i, "basisPoints", value);
+                        scheduleValidation(i, "basisPoints", value);
                       }}
                       onBlur={(e: React.FocusEvent<HTMLInputElement>) => handleBlur(i, "basisPoints", e.target.value)}
-                      style={{ marginBottom: percentageError ? "0.25rem" : undefined }}
                     />
-                    {percentageError && (
-                      <span id={`collaborator-${i}-percentage-error`} className="field-error">{percentageError}</span>
-                    )}
                   </div>
                   {collaborators.length > 1 && (
                     <button className="btn-danger" onClick={() => removeRow(i)}>
@@ -505,33 +635,36 @@ export default function InitializeForm({
         </aside>
       </div>
 
-      {collaborators.length >= MAX_COLLABORATORS - 5 && collaborators.length < MAX_COLLABORATORS && (
-        <div className="status info">
-          Approaching the limit — max {MAX_COLLABORATORS} collaborators allowed ({MAX_COLLABORATORS - collaborators.length} remaining).
-        </div>
-      )}
-      {collaborators.length >= MAX_COLLABORATORS && (
-        <div className="status error">
-          Maximum of {MAX_COLLABORATORS} collaborators reached. Remove one to add another.
-        </div>
-      )}
+        {fields.length >= MAX_COLLABORATORS - 5 && fields.length < MAX_COLLABORATORS && (
+          <div className="status info">
+            Approaching the limit — max {MAX_COLLABORATORS} collaborators allowed ({MAX_COLLABORATORS - fields.length} remaining).
+          </div>
+        )}
+        {fields.length >= MAX_COLLABORATORS && (
+          <div className="status error">
+            Maximum of {MAX_COLLABORATORS} collaborators reached. Remove one to add another.
+          </div>
+        )}
 
-      <div className="row">
-        <button className="btn-add" onClick={addRow} disabled={collaborators.length >= MAX_COLLABORATORS}>
-          + Add collaborator
-        </button>
-        <button
-          className="btn-primary"
-          onClick={submit}
-          disabled={!canSubmit}
-        >
-          {loading
-            ? "Submitting…"
-            : phase === "committed"
-              ? "Reveal & initialize"
-              : "Commit initialization"}
-        </button>
-      </div>
+        <div className="row">
+          <button
+            type="button"
+            className="btn-add"
+            onClick={() => append({ address: "", basisPoints: "" as any })}
+            disabled={fields.length >= MAX_COLLABORATORS || isSubmitting}
+          >
+            + Add collaborator
+          </button>
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={isSubmitting || hasErrors}
+            aria-busy={isSubmitting}
+          >
+            {isSubmitting ? "Submitting…" : "Initialize contract"}
+          </button>
+        </div>
+      </form>
 
       {status && <FormStatus type={status.type} message={status.message} />}
     </div>
